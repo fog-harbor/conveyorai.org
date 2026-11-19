@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>conveyor.ai — Conveyor.AI</title>
+<meta name="description" content="How to configure, deploy and run conveyor.ai — the factory, its projects, and the pipeline that moves an issue from intake to a merged pull request.">
+<meta name="robots" content="index, follow">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b8dff'/%3E%3Crect x='12' y='9' width='9' height='9' rx='2' fill='%230c0e12'/%3E%3Cpath d='M8 22h16' stroke='%230c0e12' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="nav" id="top">
+  <div class="nav-inner">
+    <a class="brand" href="index.html">
+      <svg class="mark" viewBox="0 0 32 32" role="img" aria-label="Conveyor.AI">
+        <defs>
+          <linearGradient id="cmark" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#6f9bff"/>
+            <stop offset="1" stop-color="#8b5cf6"/>
+          </linearGradient>
+        </defs>
+        <rect width="32" height="32" rx="8.5" fill="url(#cmark)"/>
+        <rect x="11.5" y="8" width="9" height="9" rx="2" fill="#0b0d11"/>
+        <path d="M7.5 21.5h17" stroke="#0b0d11" stroke-width="2.2" stroke-linecap="round"/>
+        <circle cx="11" cy="25" r="1.7" fill="#0b0d11"/>
+        <circle cx="16" cy="25" r="1.7" fill="#0b0d11"/>
+        <circle cx="21" cy="25" r="1.7" fill="#0b0d11"/>
+      </svg>
+      <span class="wordmark">Conveyor<span class="dot">.</span>AI</span>
+    </a>
+
+    <nav class="nav-links" aria-label="Sections">
+      <a href="index.html#how">How it works</a>
+      <a href="index.html#features">Features</a>
+      <a href="index.html#pipeline">Pipeline</a>
+      <a href="index.html#config">Config</a>
+    </nav>
+
+    <a class="btn btn-primary btn-sm" href="index.html#start">Get started</a>
+  </div>
+</header>
+
+<main id="main">
+
+  <section class="band page-head">
+    <div class="wrap">
+      <p class="kicker">Documentation</p>
+      <h1 class="h2">conveyor.ai</h1>
+      <p class="sub">A single, long-running <strong>factory</strong> that drives software work across <strong>many
+remote projects</strong>. (&quot;conveyor.ai&quot; is the product name; the code, the CLI helpers
+and the data directories still say <em>factory</em> — that's the internal term for the
+long-running server.) You describe each project's <em>pipeline</em> — a mapping from an
+issue <em>status</em> to a <em>tool</em> — and the factory runs those tools on the project's
+own container over SSH, watches them, and shows everything in a dashboard.</p>
+    </div>
+  </section>
+
+  <section class="band alt">
+    <div class="wrap prose doc">
+<p>It is deployed once, as one container, and manages N projects. (Earlier versions
+ran one Paperclip-based factory <em>per</em> project; that design is preserved at the
+git tag <code>paperclip-final</code>.)</p>
+<h2 id="how-it-works">How it works</h2>
+<div class="code"><pre><code>                 ┌─────────────────────── factory container ───────────────────────┐
+   you  ───────▶ │  Dashboard + REST/SSE  ·  SQLite  ·  heartbeat engine            │
+  (browser)      │                                                                  │
+                 │   SSH (launch tools + setup)          HTTP (tools call back)     │
+                 └───────────┬───────────────────────────────────▲──────────────────┘
+                             │                                    │
+                 ┌───────────▼───────────┐            ┌───────────┴───────────┐
+                 │   project A container  │            │   project B container  │
+                 │   tool runs here       │  ......    │   tool runs here       │
+                 └────────────────────────┘            └────────────────────────┘</code></pre></div>
+<ul><li><strong>SSH is the control channel</strong>: the factory SSHes into a project to <em>launch</em> a
+tool (detached) and to run a tool's one-time <em>setup</em>.</li><li><strong>HTTP is the data channel</strong>: once running, a tool calls <strong>back</strong> to the factory
+— streaming output, progress, heartbeats, status changes, and input requests.
+Only outbound (project → factory) reachability is needed; put both on a shared
+Docker network (or a tunnel) and they reach each other by DNS.</li><li>A <strong>heartbeat</strong> starts tools when an issue enters a triggering status (up to a
+per-step concurrency cap) and reaps runs whose process has died.</li></ul>
+<p>The full picture — how the core factory runs, how a project is provisioned and
+connected, what lands in the container vs. the repo, and what the factory commits
+vs. what it never does: <strong><a href="architecture.html">docs/architecture.md</a></strong>.</p>
+<h3 id="core-concepts">Core concepts</h3>
+<ul><li><strong>Tool</strong> — a reusable unit of work: a <code>setup</code> script (installs it on a project)
++ an <code>exec</code> command (runs it) + param definitions. Factory-scoped (shared) or
+project-scoped (shadows a factory tool of the same name).</li><li><strong>Workflow</strong> — a named bundle of <code>statuses</code> + a <code>pipeline</code>. <strong>Factory</strong> workflows
+are shared/reusable; each project also has a private <strong>custom</strong> workflow. A
+project <em>uses</em> one workflow (custom by default, or a factory one).</li><li><strong>Project</strong> — a remote container: SSH info, a <code>root_dir</code> to work in, a
+<code>data_folder</code> for factory state, arbitrary <code>params</code>, an issue-key <code>prefix</code>
+(defaults to the first 3 letters of the name), and the <strong>workflow</strong> it uses.</li><li><strong>Pipeline step</strong> — <code>on: &lt;status&gt;</code> → run <code>tool</code> (with <code>params</code>), at most <code>max</code>
+at once.</li><li><strong>Issue</strong> — a unit of work with a human key (<code>AIF-12</code>, from its project's
+prefix + a per-project counter), a title, body, <code>status</code>, documents, and a
+derived <strong>execution state</strong> (<code>running</code> / <code>needs_input</code> / <code>pending</code> / <code>offline</code>
+/ <code>none</code>).</li></ul>
+<h2 id="quick-start">Quick start</h2>
+<h3 id="1-deploy-the-factory">1. Deploy the factory</h3>
+<div class="code"><pre><code class="language-bash">cp .env.example .env
+#   set FACTORY_NAME, DEPLOY_SSH, GOOGLE_CLIENT_ID/SECRET, FACTORY_PUBLIC_URL,
+#   SERVICE_TOKEN, (FACTORY_NETWORK/HOSTNAME)
+./scripts/factory.sh up</code></pre></div>
+<p>This builds the image on <code>DEPLOY_SSH</code> (docker-over-SSH) and starts it. Open the
+dashboard at the URL printed by <code>up</code> (<code>http://HOST:3100</code>) and <strong>sign in with
+Google</strong>. On a brand-new factory the first person to sign in becomes the founding
+user automatically; after that, add teammates under <strong>Settings → General → Users</strong>
+(there is no self-service signup).</p>
+<h3 id="2-let-the-factory-reach-your-projects">2. Let the factory reach your projects</h3>
+<p>The factory generates its own SSH key on first boot. Authorize it on each project
+container:</p>
+<div class="code"><pre><code class="language-bash">./scripts/factory.sh pubkey     # prints the factory's public key
+#   append that line to  &lt;project&gt;:~/.ssh/authorized_keys</code></pre></div>
+<p>Projects must be reachable from the factory over SSH, and must be able to reach
+the factory over HTTP at <code>FACTORY_SELF_URL</code> (default <code>http://&lt;FACTORY_HOSTNAME&gt;:3100</code>)
+— easiest on a shared <code>FACTORY_NETWORK</code>.</p>
+<h3 id="3-describe-your-tools-projects-declarative-config">3. Describe your tools &amp; projects (declarative config)</h3>
+<p>Config lives on the container at <code>/data/factory/config/</code>:</p>
+<div class="code"><pre><code>config/
+  tools/*.yaml        # factory-scoped tools           (see config/tools/claude-agent.yaml)
+  workflows/*.yaml    # shared factory workflows        (see config/workflows/default.yaml)
+  projects/*.yaml     # one project per file — references a workflow by name,
+                      #   or defines statuses/pipeline inline (its custom workflow)</code></pre></div>
+<p>Edit the tracked <code>./config</code> tree, then push + reload:</p>
+<div class="code"><pre><code class="language-bash">./scripts/factory.sh config-push ./config
+./scripts/factory.sh reload</code></pre></div>
+<p>The repo ships a <code>claude-agent</code> example tool and an example project template.</p>
+<h3 id="4-connect-a-project-and-submit-work">4. Connect a project and submit work</h3>
+<p>In the dashboard: select the project → <strong>Connect</strong> (installs helpers + runs tool
+setup over SSH) → <strong>+ New issue</strong>. When the issue's status matches a pipeline
+step, the heartbeat launches the tool; watch its output stream live, answer any
+questions it asks, and follow it through the pipeline.</p>
+<h2 id="deploying-a-project-container">Deploying a project container</h2>
+<p>The factory operates on projects that live in their own containers. Stand one up
+from a GitHub repo with one command — plain Docker, synthesized from a default
+image + the repo's own docker files + overrides:</p>
+<div class="code"><pre><code class="language-bash">./scripts/factory.sh project up &lt;owner/repo&gt;          # simplest: just the repo
+./scripts/factory.sh project up &lt;repo&gt; PROJECT_HOSTNAME=api BASE_IMAGE=node:20-bookworm</code></pre></div>
+<p><strong>How it works</strong> (this runs on your machine; the container runs on the factory's
+host on <code>FACTORY_NETWORK</code>):</p>
+<ol><li>shallow-clones the repo (using <code>GH_TOKEN</code>) to read its <code>.factory/development/</code>
+files and serve as build context;</li><li><strong>synthesizes</strong> the build: the factory's default <code>project/Dockerfile</code> with the
+repo's <code>.factory/development/Dockerfile</code> fragment appended; the default
+<code>project/features.json</code> merged with the repo's <code>.factory/development/features.json</code>;
+and a generated compose with the repo's <code>.factory/development/compose.override.yaml</code>
+layered on;</li><li>builds the image — with <strong><code>devcontainer build</code></strong> when any features are declared
+(so you can reuse the published <a href="https://containers.dev">devcontainer features</a>
+ecosystem), else a plain <code>docker build</code> — then runs it on <code>FACTORY_NETWORK</code> with
+a DNS alias + persistent volumes;</li><li>the entrypoint <strong>clones the repo from its URL into a <code>~/workspaces</code> volume at
+init</strong> (not a bind mount), authorizes the factory + your SSH keys, and runs
+the repo's <code>.factory/development/setup.sh</code> (or a default lockfile install).</li></ol>
+<p>Default image ships Node, Claude Code, TypeScript, <code>curl</code>; <code>gh</code> comes from the
+default feature. The container runs sshd as user <code>dev</code>. Devcontainer is used
+<strong>only as a feature-aware image builder</strong> — no devcontainer runtime, no workspace
+mounts; the built image's feature <code>containerEnv</code> is folded into the container so
+SSH sessions see it.</p>
+<ul><li><strong>Prerequisites</strong>: <code>FACTORY_NETWORK</code> set (so the factory reaches the container
+by DNS); <code>GH_TOKEN</code> in <code>.env</code> for private clones (both the local read-clone and
+the in-container clone use it). Node/npx is needed where the BUILD runs — the
+factory itself, which is a Node image, so there is nothing to install; it is no
+longer a prerequisite on your machine (AIF-215).</li><li><strong>Config precedence</strong> (low → high): factory defaults → the repo's
+<code>.factory/development/env</code> → <code>KEY=VAL</code> args. Recognized: <code>BASE_IMAGE</code>,
+<code>PROJECT_NAME</code>, <code>PROJECT_HOSTNAME</code>, <code>PROJECT_REPO_DIR</code>; any other var is passed
+into the container for <code>.factory/development/setup.sh</code>.</li><li><strong>Persistence</strong>: per-container named volumes keep the checkout
+(<code>/home/dev/workspaces/&lt;name&gt;</code>) and the one-time Claude login across rebuilds.</li><li><p><strong>Managing it</strong>:</p>
+<div class="code"><pre><code class="language-bash">./scripts/factory.sh project ssh &lt;name&gt; [cmd]   # shell in as dev
+./scripts/factory.sh project redeploy &lt;name&gt;    # rebuild + restart (reuses config)
+./scripts/factory.sh project down &lt;name&gt;        # stop (keep volumes)
+./scripts/factory.sh project rm &lt;name&gt;          # remove + delete volumes/image
+./scripts/factory.sh project ps | logs &lt;name&gt; | list</code></pre></div></li></ul>
+<p><code>project up</code> prints the exact values to register it in the dashboard (name, SSH
+host = the DNS alias, user <code>dev</code>, port 22, root dir).</p>
+<p><strong>What a project repo can define</strong> for its factory <strong>development container</strong> (all
+optional) — copy the samples in <code>project/examples/</code>. These live
+under <code>.factory/development/</code>, clearly a factory interface; your repo's own <code>deploy/</code>
+(live deployment) is separate and never read by the factory.</p>
+<div class="table-wrap"><table><thead><tr><th>file (in the project repo)</th><th>effect</th></tr></thead><tbody><tr><td><code>.factory/development/env</code></td><td>variable overrides; also passed to <code>setup.sh</code> as env</td></tr><tr><td><code>.factory/development/features.json</code></td><td>devcontainer features (strict JSON), merged over the factory default</td></tr><tr><td><code>.factory/development/Dockerfile</code></td><td>extra build steps appended to the default image (fragment: no <code>FROM</code>)</td></tr><tr><td><code>.factory/development/setup.sh</code></td><td>dev setup run after clone (else a default lockfile install)</td></tr><tr><td><code>.factory/development/compose.override.yaml</code></td><td>compose override — ports, mounts, sidecars (service <code>dev</code>)</td></tr></tbody></table></div>
+<h2 id="authoring-a-tool">Authoring a tool</h2>
+<p>A tool's <code>exec</code> runs on the project in <code>root_dir</code> with a rich environment:</p>
+<div class="table-wrap"><table><thead><tr><th>Provided</th><th>What</th></tr></thead><tbody><tr><td><code>$FACTORY_ISSUE_KEY</code></td><td>the issue's human key, e.g. <code>AIF-12</code> (may be empty)</td></tr><tr><td><code>$FACTORY_ISSUE_DIR</code></td><td>issue dir on the project (contains <code>ISSUE.md</code>)</td></tr><tr><td><code>$FACTORY_DOCS_DIR</code></td><td>write documents here (surfaced in the dashboard)</td></tr><tr><td><code>$FACTORY_RUN_DIR</code></td><td>this run's scratch/output dir</td></tr><tr><td><code>PROJECT_*</code></td><td>every project param (e.g. <code>PROJECT_REPO</code>)</td></tr><tr><td><code>PARAM_*</code></td><td>step params + tool defaults (e.g. <code>PARAM_PHASE</code>)</td></tr></tbody></table></div>
+<p>And these helper commands on <code>PATH</code>:</p>
+<ul><li><code>factory-progress &quot;msg&quot; [pct]</code> — report progress.</li><li><code>factory-ask &quot;prompt&quot;</code> — ask the user; <strong>blocks</strong> until they answer in the
+dashboard; prints the answer to stdout.</li><li><code>factory-set-status &lt;status&gt;</code> — move the issue on (this is how a step hands off
+to the next step in the pipeline).</li><li><code>factory-comment &quot;text&quot;</code> — add a comment to the issue's thread (the factory
+prefixes it with the tool's name); also reads the body from stdin.</li><li><code>factory-summary &quot;text&quot;</code> — set the issue's <strong>summary</strong>: a few sentences on what
+has been done and where it stands, shown at the top of the issue's Info tab so
+a human can catch up without reading the output and comment history. Unlike a
+comment it <strong>overwrites</strong>, so each tool restates the whole current picture;
+also reads from stdin.</li><li><code>factory-ready [&quot;what to try&quot;]</code> — report the implementation testable. The
+dashboard's <strong>Run</strong> button for an issue stays disabled until some tool says
+this, so a human never stages a branch with nothing on it yet.</li></ul>
+<p>Tool comms are best-effort with retry: a tool keeps running even if the factory
+is briefly unreachable, and reconnects after a factory restart.</p>
+<blockquote><p>Project containers need <code>bash</code>, <code>curl</code>, coreutils, <code>ps</code>, and <code>setsid</code>
+(util-linux) for the wrapper; a tool's <code>setup</code> installs whatever else it needs.</p></blockquote>
+<h2 id="operating">Operating</h2>
+<div class="code"><pre><code class="language-bash">./scripts/factory.sh up|down|ps|logs        # lifecycle
+./scripts/factory.sh redeploy               # safe rebuild: build → swap → health-check → auto-rollback
+./scripts/factory.sh runner up|down|logs|ps # manage the containerized CI deploy runner (see docs/self-deploy.md)
+./scripts/factory.sh ssh [cmd]              # shell into the factory box
+./scripts/factory.sh url                    # dashboard URL (+token)
+./scripts/factory.sh pubkey                 # factory SSH public key
+./scripts/factory.sh config-push [dir]      # push local config, then reload
+./scripts/factory.sh reload                 # reconcile config in place</code></pre></div>
+<p>State (SQLite DB, SSH keypair, run logs, config) lives on the <code>factory-data</code>
+volume and survives rebuilds. Run several factories on one host with unique
+<code>FACTORY_NAME</code> + ports per clone.</p>
+<h3 id="self-deploy-the-factory-manages-its-own-repo">Self-deploy (the factory manages its own repo)</h3>
+<p>The factory can manage this very repo as a project — the agent makes changes on
+branches and merges to <code>main</code>; a <strong>self-hosted GitHub Actions runner (itself a
+container on the docker host)</strong> redeploys on push (build → swap → health-check →
+rollback), so no deploy credentials ever live in an agent-operated container. The
+runner mounts the host docker socket (docker-out-of-docker) to swap the factory as
+a sibling container, and joins <code>FACTORY_NETWORK</code> to health-check it by DNS:</p>
+<div class="code"><pre><code class="language-bash">RUNNER_PAT=&lt;repo-scoped GitHub PAT&gt; ./scripts/factory.sh runner up
+./scripts/factory.sh runner logs|ps|down|rm</code></pre></div>
+<p>One-time runner + secret setup (incl. the Docker Desktop socket note for a Mac
+mini host): <strong><a href="self-deploy.html">docs/self-deploy.md</a></strong>.</p>
+<h3 id="ad-hoc-conversations">Ad hoc conversations</h3>
+<p>Every issue and project page has a <strong>Conversation</strong> tab — a chat box wired to a
+Claude agent on the factory container. It gets that issue's (or project's)
+context and can call the operator API, answer a stage that is waiting on input,
+or SSH in and do real work in the issue's branch worktree. The projects screen
+has one too (<code>/conversation</code>), attached to the whole factory: it knows every project
+and works across all of them. Needs a one-time
+<code>claude</code> sign-in on the factory (or <code>ANTHROPIC_API_KEY</code>):
+<strong>docs/conversation.md</strong>.</p>
+<h3 id="api-and-mcp-access">API and MCP access</h3>
+<p><code>/api/v1</code> is a versioned REST surface over projects, issues, epics, comments,
+dependencies and run logs, and <code>/mcp</code> is the same capabilities as MCP tools, so a
+coding agent can read and drive the factory directly. Both take a personal API
+token (Settings → <strong>API</strong>, which also prints ready-made Claude Desktop and Claude
+Code snippets) or an OAuth access token. Full reference — credentials, every
+route, the error codes, the tool list and the connection recipes:
+<strong>docs/api.md</strong>.</p>
+<h3 id="linear-sync-optional">Linear sync (optional)</h3>
+<p>Set <code>LINEAR_API_KEY</code> in <code>.env</code> and add a <code>linear: { team: … }</code> block to a
+project's config, and that project's issues, statuses and comments sync both
+ways with a Linear team. Unset key = the feature is completely inert. Note that
+state reconciliation rewrites the Linear <strong>team's</strong> workflow states to match the
+factory's: <strong><a href="linear-sync.html">docs/linear-sync.md</a></strong>.</p>
+<h3 id="messaging-questions-and-replies-optional">Messaging questions and replies (optional)</h3>
+<p>Set <code>TWILIO_ACCOUNT_SID</code>, <code>TWILIO_AUTH_TOKEN</code> and <code>TWILIO_FROM_NUMBER</code> in <code>.env</code>,
+then pick <strong>SMS</strong> with your phone number in Settings → Notifications. A stage that
+needs input messages you the question, and replying answers it — the reply
+reaches the waiting tool exactly as if you had typed it in the dashboard.
+Point the Twilio number's inbound webhook at <code>&lt;FACTORY_PUBLIC_URL&gt;/twilio/sms</code>.
+Only one question is sent at a time, so a plain reply is never ambiguous; the
+rest wait in the dashboard as usual. Unset credentials = the channel is inert.</p>
+<p><strong>WhatsApp</strong> is the same flow over a different service: add
+<code>TWILIO_WHATSAPP_FROM</code> and <code>TWILIO_WHATSAPP_TEMPLATE_SID</code> and pick it in the same
+place. The template SID is required because WhatsApp only accepts pre-approved
+templates outside a session you opened, and a stage's question arrives cold —
+approve one with two variables (<code>{{1}}</code> the issue, <code>{{2}}</code> the question). One
+service is active at a time and both share the number you save, so switching is
+one click and no retyping. Point the WhatsApp sender's inbound webhook at the
+same <code>/twilio/sms</code> URL.</p>
+<h2 id="repo-layout">Repo layout</h2>
+<div class="code"><pre><code>Dockerfile                 factory image (Node 22 + the server)
+compose.yaml               single `factory` service (+ compose.external-net.yaml overlay)
+scripts/
+  factory.sh               deploy/manage over docker-over-SSH
+  container-init.sh         entrypoint: sshd + exec the server
+  ssh.sh                   `factory.sh ssh` helper
+factory/server/            the factory server (TypeScript)
+  src/                     config, db, ssh, setup, runner, engine, api, routes
+  remote/                  helper scripts installed on each project
+  web/                     the dashboard (static, no build)
+config/                    example tools + project template (push to the container)</code></pre></div>
+<h2 id="security-notes">Security notes</h2>
+<ul><li>Every page and every <code>/api/*</code> call requires a signed-in user (Google OAuth) —
+no credential is ever accepted from a URL query string. The factory can trigger
+remote code on your projects, so still keep the port behind a trusted
+network/tunnel.</li><li><code>SERVICE_TOKEN</code> is a header-only credential for factory-owned automation (the
+self-deploy runner). Treat it like a root password.</li><li>Each project gets a durable bearer token authenticating its containers'
+callbacks; param values are passed as env (never interpolated into a shell).</li><li>Project SSH details live in the SQLite DB on the volume (plaintext) — treat the
+host accordingly.</li></ul>
+    </div>
+  </section>
+
+</main>
+
+<footer class="foot">
+  <div class="wrap foot-inner">
+    <p class="foot-brand">Conveyor<span class="dot">.</span>AI</p>
+    <nav class="foot-links" aria-label="Documentation">
+      <a href="docs.html">Docs</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="self-deploy.html">Self-deploy</a>
+      <a href="linear-sync.html">Linear sync</a>
+      <a href="privacy.html">Privacy</a>
+      <a href="messaging.html">Messaging</a>
+    </nav>
+    <p class="foot-note">A factory for software work.</p>
+  </div>
+</footer>
+
+</body>
+</html>

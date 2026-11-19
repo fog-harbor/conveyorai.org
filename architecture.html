@@ -1,0 +1,909 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Architecture — Conveyor.AI</title>
+<meta name="description" content="How conveyor.ai is put together: what runs where, how a project is stood up, and what the factory commits versus what it never does.">
+<meta name="robots" content="index, follow">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b8dff'/%3E%3Crect x='12' y='9' width='9' height='9' rx='2' fill='%230c0e12'/%3E%3Cpath d='M8 22h16' stroke='%230c0e12' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="nav" id="top">
+  <div class="nav-inner">
+    <a class="brand" href="index.html">
+      <svg class="mark" viewBox="0 0 32 32" role="img" aria-label="Conveyor.AI">
+        <defs>
+          <linearGradient id="cmark" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#6f9bff"/>
+            <stop offset="1" stop-color="#8b5cf6"/>
+          </linearGradient>
+        </defs>
+        <rect width="32" height="32" rx="8.5" fill="url(#cmark)"/>
+        <rect x="11.5" y="8" width="9" height="9" rx="2" fill="#0b0d11"/>
+        <path d="M7.5 21.5h17" stroke="#0b0d11" stroke-width="2.2" stroke-linecap="round"/>
+        <circle cx="11" cy="25" r="1.7" fill="#0b0d11"/>
+        <circle cx="16" cy="25" r="1.7" fill="#0b0d11"/>
+        <circle cx="21" cy="25" r="1.7" fill="#0b0d11"/>
+      </svg>
+      <span class="wordmark">Conveyor<span class="dot">.</span>AI</span>
+    </a>
+
+    <nav class="nav-links" aria-label="Sections">
+      <a href="index.html#how">How it works</a>
+      <a href="index.html#features">Features</a>
+      <a href="index.html#pipeline">Pipeline</a>
+      <a href="index.html#config">Config</a>
+    </nav>
+
+    <a class="btn btn-primary btn-sm" href="index.html#start">Get started</a>
+  </div>
+</header>
+
+<main id="main">
+
+  <section class="band page-head">
+    <div class="wrap">
+      <p class="kicker">Documentation</p>
+      <h1 class="h2">Architecture</h1>
+      <p class="sub">How conveyor.ai (internally <em>the factory</em>) is put together: what runs where, how
+a project gets stood up and connected, what lands in a project container versus
+the project's repo, and what the factory commits versus what it deliberately
+never does.</p>
+    </div>
+  </section>
+
+  <section class="band alt">
+    <div class="wrap prose doc">
+<p>The product is <strong>conveyor.ai</strong>; the code, CLI helpers and data dirs say <em>factory</em>.
+Both names appear below and mean the same thing.</p>
+<h2 id="1-the-core-factory">1. The core factory</h2>
+<p>One long-running container manages N projects. It is not a per-project runner —
+it is deployed once and holds all the state.</p>
+<div class="code"><pre><code>                 ┌──────────────────── factory container ─────────────────────┐
+   browser ─────▶│  dashboard (static JS) + REST + SSE                        │
+                 │  SQLite (/data/factory/factory.db)                          │
+                 │  heartbeat engine  ·  container pool  ·  stage proxy        │
+                 └────────┬──────────────────────────────────▲────────────────┘
+                          │ SSH (launch + setup)              │ HTTP (callbacks)
+                 ┌────────▼─────────┐              ┌──────────┴───────┐
+                 │ AIF-12's cont.   │   ......     │ AIF-13's cont.   │
+                 │ tools run here   │              │ tools run here   │
+                 └──────────────────┘              └──────────────────┘
+                  one container per ISSUE, from a capped pool (§2)</code></pre></div>
+<p><strong>Two channels, deliberately asymmetric:</strong></p>
+<ul><li><strong>SSH — outbound, control only.</strong> The factory SSHes into a project to install
+helpers, run a tool's <code>setup</code> script, and <em>launch</em> a tool detached (<code>setsid</code>,
+fds to <code>/dev/null</code>). It never holds the connection open for the duration of a
+run.</li><li><strong>HTTP — inbound, all the data.</strong> Once running, the tool calls <strong>back</strong> to the
+factory at <code>FACTORY_URL</code> with output chunks, heartbeats, progress, status
+changes, comments and input requests. All best-effort with retry, so a tool
+survives a factory restart mid-run.</li></ul>
+<p>That split is why only project→factory HTTP reachability and factory→project SSH
+are required; put both on a shared Docker network (<code>FACTORY_NETWORK</code>) and they
+find each other by DNS alias.</p>
+<h3 id="processes-inside-the-container">Processes inside the container</h3>
+<p><code>scripts/container-init.sh</code> is the entrypoint. As root it installs the operator
+SSH key, persists sshd host keys on the volume, starts <code>sshd</code> on :22, adds <code>dev</code>
+to the docker-socket group, then <code>exec</code>s the server as unprivileged <code>dev</code>
+(<code>factory/server/src/main.ts</code>).</p>
+<p>The server boots in this order: open+migrate SQLite → ensure the outbound SSH
+keypair → seed declarative config <strong>only if the DB is empty</strong> → reconcile
+in-flight runs and stages → start HTTP → start the heartbeat.</p>
+<h3 id="the-heartbeat-engine">The heartbeat engine</h3>
+<p><code>src/engine.ts</code> beats on an interval (<code>HEARTBEAT_SEC</code>, default 15). Beats never
+overlap — but the guard <em>expires</em> (<code>beatMayStart</code>), because a guard without one
+turns a single wedged beat into a permanently silent engine.</p>
+<p>Each beat first does the factory-wide work, in this order:</p>
+<ol><li><strong>reap runs</strong> — finalize runs whose heartbeat went stale, whose process is
+gone (verified over SSH), or that are <em>superseded</em> (the issue already
+advanced past the run's <code>status_version</code>).</li><li><strong>the pool sweeps</strong>, and their order is load-bearing (see the pool section
+below): vanished containers first, since everything after it assumes a row
+points at something real; then retry pending persists; then reclaim abandoned
+holds; then reap idle containers on a billed backend (<em>after</em> the hold sweep,
+so one handed back this beat is considered at once); then sweep orphaned
+instances, throttled to <code>ORPHAN_SWEEP_SEC</code> — &quot;orphaned&quot; meaning stamped with
+THIS factory's instance id (<code>FACTORY_INSTANCE_ID</code>, else generated into
+<code>&lt;data dir&gt;/instance-id</code>, AIF-656), so two factories sharing a docker socket
+or fly org never sweep each other; unstamped legacy instances are never swept. Orphaned stage/conversation session
+containers are released last.</li><li><strong>the epic scheduler</strong> — deliberately <em>before</em> the project pass, so an issue
+promoted now launches in this same beat.</li><li><strong>dependency waits</strong> — let issues back in once their blockers land. The
+kickstart hook already does this the instant a blocker goes terminal; this is
+the safety net for moves no status change announces.</li></ol>
+<p>Then, per project (bounded concurrency, <code>maxProjectConcurrency</code>):</p>
+<ol><li><strong>ping</strong> over SSH — sets the reachability flag; skip an offline project.</li><li><strong>auto-setup / re-provision</strong> — hashes the provisioning <em>inputs</em> (the helper
+script set + each pipeline tool's <code>setup_script</code> + a layout version). If the
+hash drifted from what was last applied, re-run setup over SSH. A pure local
+hash compare when nothing changed, so it costs nothing on a normal beat.</li><li><strong><code>reconcileProjectImage</code></strong> to pick up a changed
+<code>.factory/development/Dockerfile</code>. Fire-and-forget.</li><li><strong>schedule</strong> — walking the project's issues <em>oldest-waiter-first</em>, so the
+issue that has waited longest on a full step claims the next slot. For each
+issue whose <code>status</code> matches a pipeline step, launch the step's tool, subject
+to: the dependency gate, a container slot from the pool, one run per
+<code>(step, status_version)</code> so the same status can't re-fire, the step's <code>max</code>
+and <code>max_per_project</code> concurrency, and a circuit breaker against status-loop
+ping-pong.</li></ol>
+<p>Linear sync, the GitHub Actions indicator, the deployed-to-production check and
+the token check ride the end of the beat, each behind its own <code>try</code>/<code>catch</code> — an
+outage in any of them must never stop reaping or scheduling.</p>
+<p><strong>The deployed mark (AIF-459).</strong> <code>src/deploystatus.ts</code> asks the GitHub
+Deployments API which commit is live in each project's production environment
+(<code>params.production_environment</code>, default <code>production</code>, matched
+case-insensitively) and flags every merged issue whose merge commit is in that
+commit's history — <code>issues.deployed</code>, rendered as a small mark on issue rows and
+the issue detail header. Both expensive questions are answered in bulk rather
+than per issue: one page of the project's closed PRs resolves a hundred merge
+commits at once (matched to issues by branch name), and ancestry is membership
+in one page of the deployed commit's history rather than a <code>compare</code> call each.
+A candidate is only re-examined once the project's deployed sha <em>changes</em>, so the
+steady state is two API calls per project per interval. A project whose pipeline
+creates no GitHub Deployments is a silent no-op — no mark, no error — which is
+why this repo's own <code>deploy.yml</code> records one (<code>record-deployment</code>) and every
+other project must do the same for its issues to be marked.</p>
+<p>Launching is transition-triggered, not polled: output and status arrive over
+HTTP as they happen.</p>
+<h3 id="domain-model">Domain model</h3>
+<div class="table-wrap"><table><thead><tr><th>Concept</th><th>What it is</th></tr></thead><tbody><tr><td><strong>Tool</strong></td><td><code>setup</code> script + <code>exec</code> command + param definitions. Factory-scoped (shared) or project-scoped (shadows a factory tool of the same name).</td></tr><tr><td><strong>Workflow</strong></td><td>A named bundle of <code>statuses</code> + a <code>pipeline</code>. Factory workflows are shared; each project also has a private <em>custom</em> one.</td></tr><tr><td><strong>Project</strong></td><td>A remote container: SSH info, <code>root_dir</code>, <code>data_folder</code>, <code>params</code>, issue-key <code>prefix</code>, and the workflow it uses.</td></tr><tr><td><strong>Pipeline step</strong></td><td><code>on: &lt;status&gt;</code> → run <code>tool</code> with <code>params</code>, at most <code>max</code> at once.</td></tr><tr><td><strong>Issue</strong></td><td>Key (<code>AIF-12</code>), title, body, status, type, properties, documents, comments, plus a derived exec state (<code>running</code>/<code>needs_input</code>/<code>pending</code>/<code>offline</code>/<code>none</code>).</td></tr></tbody></table></div>
+<h3 id="configuration-yaml-seeds-the-db-rules">Configuration: YAML seeds, the DB rules</h3>
+<p><code>config/tools|workflows|projects/*.yaml</code> is a <strong>bootstrap seed</strong>, imported only
+when the DB is empty (or on an explicit <code>POST /api/reload</code>). After that the
+SQLite DB is the source of truth, because the dashboard writes to it directly —
+so a restart never clobbers UI-managed data. <code>factory.sh redeploy</code> syncs the
+repo's config tree into the live factory and reloads it after the health check
+(upsert-only, best-effort).</p>
+<h3 id="factory-side-state-data-the-factory-data-named-volume">Factory-side state (<code>/data</code>, the <code>factory-data</code> named volume)</h3>
+<div class="code"><pre><code>/data/factory/
+  factory.db          SQLite: projects, tools, workflows, issues, runs, users, conversation threads (`terminal_*` tables)
+  config/             the pushed YAML tree
+  ssh/                the factory's outbound keypair (+ known_hosts)
+  ssh-hostkeys/       sshd host keys, so the fingerprint survives rebuilds
+  runs/&lt;run&gt;/         factory-side copy of each run's output.log
+  claude/             the factory's own claude login (conversation agent)
+  terminal/factory/   the factory conversation's scratch + clones</code></pre></div>
+<p>Everything else in the container is rebuilt from the image. Run several
+factories on one host by giving each a unique <code>FACTORY_NAME</code> and port set.</p>
+<h3 id="deploying-the-factory-itself">Deploying the factory itself</h3>
+<p><code>scripts/factory.sh</code> points your local docker CLI at the host over SSH
+(<code>DOCKER_HOST=ssh://…</code>), so <code>up</code>/<code>redeploy</code> build the image <strong>on the host</strong> — no
+registry. <code>redeploy</code> is build → tag current as <code>:prev</code> → swap → health-check →
+auto-rollback. In practice you don't run it: pushes to <code>main</code> are redeployed by
+a self-hosted GitHub Actions runner that is itself a container on the docker host
+(docker-out-of-docker), so no deploy credential ever lives in an agent-operated
+container. See <a href="self-deploy.html">self-deploy.md</a>.</p>
+<hr>
+<h2 id="2-containers-one-per-issue-from-a-pool">2. Containers: one per issue, from a pool</h2>
+<p>The diagram above shows one container per project. That is no longer the unit of
+work: since AIF-139 <strong>each issue gets its own container</strong>, drawn from a capped,
+factory-wide pool, so two issues never share a checkout. A project's own
+container still exists — it is the pool's first member.</p>
+<p><code>src/pool.ts</code> is the side-effecting lifecycle, <code>src/poolplan.ts</code> the <strong>pure</strong>
+allocation rules (no docker, no db, no clock — so they can be tested
+exhaustively), <code>src/poolstore.ts</code> the rows.</p>
+<h3 id="allocation">Allocation</h3>
+<p><code>allocateFor(project, issue)</code> never blocks the beat: it returns what it has right
+now and provisions in the background. The rule, in order:</p>
+<ol><li>an idle container of this project (and this backend) → <strong>reuse</strong> it;</li><li>room under the cap (<code>MAX_CONTAINERS</code>, default 4) → <strong>create</strong> one;</li><li>an idle container of <em>another</em> project → <strong>evict</strong> it, then create;</li><li>otherwise → <strong>block</strong> until something frees up.</li></ol>
+<p>Plus <code>wait</code>: if one is already coming up for this project, sit tight rather than
+race a second one up. A <code>starting</code> row counts against the cap the instant it
+exists, which is what stops two beats both &quot;finding room&quot;. Decide-and-reserve is
+one synchronous transaction; the slow work happens outside it.</p>
+<p>&quot;Mine&quot; means this project <strong>and this backend</strong> — a project that ran on local and
+was later switched to fly has rows on both, and they are not interchangeable.</p>
+<h3 id="tiering-the-ordered-policy-aif-302">Tiering: the ordered policy (AIF-302)</h3>
+<p>The factory-wide default is not one backend but an ordered list of <strong>tiers</strong>,
+each with its own cap: <code>[{local, cap 4}, {fly, cap 6}]</code> reads &quot;four local
+containers; when local can place nothing, spill to fly, up to six&quot;.</p>
+<p><code>decidePlacement</code> runs the rule above <strong>once per tier, in policy order</strong>, and
+takes the first tier that returns anything other than <code>block</code>. That composition
+is the whole design, and three properties fall out of it rather than being coded:</p>
+<ul><li><strong><code>wait</code> beats spilling.</strong> One already coming up on tier 1 is not <code>block</code>, so
+nothing races a duplicate onto a tier that costs money.</li><li><strong>Evicting beats spilling.</strong> Within a tier the order is still reuse → create →
+evict → block, so tier 2 is reached only when tier 1 is at its cap <em>and</em> has
+nothing idle. Evicting costs a cold start for work that already finished;
+spilling costs money <em>and</em> a cold start.</li><li><strong>The pool drains back on its own.</strong> Reuse is per tier, so as tier 1 frees up
+new work lands there and the spilled containers go idle and are reaped. No
+rebalancer.</li></ul>
+<p>Each tier sees only <strong>its own backend's rows</strong>, which is what makes the caps
+per-backend without <code>countsAgainstCap</code> learning about backends. It also scopes
+<strong>eviction</strong>, which is a deliberate change from the untiered rule: under
+per-backend caps, evicting a fly container frees nothing on local. With one tier
+every filter is the identity, so an unconfigured factory is unchanged.</p>
+<p>A tier is only <strong>eligible</strong> if it can actually take the work. Tier 1 needs only
+to be reachable; a spill tier must also have been available on the <strong>last two</strong>
+samples (so a flapping backend cannot take a spill it will strand) and have a
+<strong>published image</strong> for this project (spilling onto a backend with no image is a
+multi-minute build at peak, looking like a hang — AIF-260 one level up). Health
+comes from <code>backendhealth.ts</code>, sampled once per beat and read synchronously
+inside the placement transaction; a sample older than four beats reads as
+unavailable rather than as its last value. <strong>Health never stops the factory</strong>: if
+no tier is eligible, the first one refused for a merely momentary reason is tried
+anyway, which is what the factory did before tiering existed.</p>
+<p>A <strong>project override still names one backend and pins the project to it</strong>, with
+no spill — AIF-259's principle, that an operator picks a backend for reasons and
+a project that must not move needs a way to say so. The ordered policy is a
+factory-wide default only.</p>
+<p>Spilling is <strong>said out loud</strong>: leaving tier 1 puts a comment on the issue naming
+the tier and why, because tiering deliberately reintroduces &quot;ran somewhere you
+did not individually pick&quot; and the bar is that the issue itself answers it. The
+Containers screen badges each container's tier (derived from its backend against
+the current policy, so a reorder relabels rather than going stale) and the Health
+page reports running/idle/cap per tier. Each tier also carries its own <strong>reap
+timeout</strong>, defaulting to the global one — a spill tier wants a much shorter fuse,
+since it absorbs bursts rather than holding warm checkouts.</p>
+<h3 id="addressing-the-container-not-the-project">Addressing: the container, not the project</h3>
+<p><code>execSSH</code> &amp; co. take an <code>SshTarget</code>. Get one from <code>resolveTarget(project, issue)</code>
+(or <code>resolveSessionTarget</code>), which returns the held container's target if the
+project is pooled and the project's own host otherwise. Passing <code>project</code>
+directly still compiles — it means &quot;the project's own host&quot;, which is only right
+for an unpooled project.</p>
+<p><code>hasDedicatedContainer(issue)</code> is the related question: if the issue owns its
+container, its stages check the branch out in the container's <strong>main checkout</strong>
+(nobody else is there to clash with). If not, they fork a worktree, as before.</p>
+<h3 id="synthesis-not-adoption">Synthesis, not adoption</h3>
+<p>Every container is <strong>synthesized</strong> from the project's <code>repo</code> param and its image
+(<code>runArgsFor</code> in <code>backends/local.ts</code>): its own name, which is also its network
+alias and the stem of the two named volumes it owns (<code>&lt;name&gt;-data</code>,
+<code>&lt;name&gt;-workspaces</code>). The project's first container and its twentieth are made
+by the same call, and none of them is special — nothing is pinned, nothing is
+exempt from eviction, and losing one costs nothing that cannot be rebuilt.</p>
+<p>It used to work the other way (removed in AIF-292). A human ran
+<code>scripts/project.sh</code>; the pool <strong>adopted</strong> the container that produced as the
+project's first pool member, <code>pinned</code> so it was never evicted; and its <code>docker
+inspect</code> became the <strong>template</strong> every sibling was cut from. That made the first
+container a single point of failure and meant the server could not describe a
+container it had not already been shown one of — so a project could not exist
+until somebody had run a shell script against the docker host. The clone URL is
+enough to build the image and the params are enough to run it, which is what the
+fly backend had always done and what the local one now does too.</p>
+<h3 id="release-and-the-sweeps-that-catch-what-release-misses">Release, and the sweeps that catch what release misses</h3>
+<p>A container goes back to the pool through <code>persistAndRelease</code>, which <strong>pushes
+every branch the issue produced first</strong> and only then lets go. That ordering is
+the protection: the container stays held — and so can never be evicted — until
+the push has actually landed. A push that keeps being refused escalates to a
+rescue ref after five consecutive failures, so the work can get off the box
+rather than pinning it forever.</p>
+<p>That escalation assumes the push can eventually land somewhere. When it cannot —
+a <code>root_dir</code> that is not a checkout, so <code>factory-persist</code> itself cannot run and
+<code>--rescue</code> is refused identically — the retry is <strong>bounded</strong>: after roughly an
+hour of consecutive failures the factory says so on the issue thread and releases
+the container anyway (AIF-475). A local diff that provably cannot be pushed is
+worth less than a pool slot, and the pool is factory-wide: one misconfigured
+project once held all 55 slots for two and a half days. The same bound covers the
+helper-refresh deferral, so a refresh that can never land cannot hold a slot by
+never attempting the push at all. Project <code>root_dir</code> must now be an absolute
+path, which is what stops the commonest cause at the door.</p>
+<p>Two paths release normally: a transition into a terminal status, and a
+transition into <code>cancelled</code> (which <code>cleanup.ts</code> owns — pushing there would
+resurrect work the operator threw away). <strong>Every other way an issue can stop
+moving leaks the container</strong>: dragged back to backlog, failed into <code>error</code>,
+parked waiting on a human. <code>sweepAbandonedHolds</code> is the rule that takes it back
+on a <strong>timeout</strong> (<code>CONTAINER_HOLD_TIMEOUT_SEC</code>, default 1800), through the same
+<code>persistAndRelease</code>. It is deliberately conservative — a run still going, a
+stage serving from that checkout, a conversation work turn in flight, or an
+unreadable clock all mean &quot;don't touch it&quot;.</p>
+<p>The window is <strong>per hold, not one factory-wide number</strong> (AIF-343). A container
+an <em>issue conversation</em> asked for, that no pipeline run has since used, goes back
+after <code>TERMINAL_CONTAINER_HOLD_SEC</code> (default 600) instead — nobody but the
+operator ever wanted it. Once a run starts against it the ordinary rule applies
+again, and <code>CONTAINER_HOLD_TIMEOUT_SEC=0</code> still turns the whole sweep off.</p>
+<p>That timeout is <em>why</em> <code>dev-agent</code> branches a missing <code>$BRANCH</code> off
+<code>origin/$BRANCH</code> rather than the base branch: a later stage can land on a
+container that has never seen the branch, and cutting from the base would orphan
+the work.</p>
+<p>The remaining sweeps cover the cases that fall between: <code>sweepVanishedContainers</code>
+(a row whose instance was destroyed underneath it), <code>sweepIdleBilledContainers</code>
+(idle, healthy row, on a backend that charges for it), and <code>sweepOrphans</code> (an
+instance with <strong>no</strong> row — every teardown drops the row before calling the
+backend, so a refused destroy leaves one running that nothing counts).</p>
+<h3 id="compute-backends">Compute backends</h3>
+<p>Since AIF-227/AIF-229 the pool does not talk to docker at all; it goes through a
+<code>ComputeBackend</code>. <code>src/backends/</code> is a registration <strong>table</strong> (<code>local</code>, <code>fly</code>) —
+the same shape <code>messaging.ts</code> uses for its providers, and for the same reason:
+adding one should be an entry plus a module, not another conditional threaded
+through every call site.</p>
+<p>Resolution happens in exactly two shapes, and keeping them apart is what stops a
+settings change breaking containers that already exist:</p>
+<div class="code"><pre><code>tiersFor(project)         project override (one tier) &gt; the ordered policy
+backendFor(project)       the first of those tiers that can actually run
+backendForContainer(row)  whatever CREATED that row              &gt; local</code></pre></div>
+<ul><li><strong><code>backendFor(project)</code></strong> <em>chooses</em> one. Called only from <code>reserve()</code> — the one
+place that makes a row from nothing. A choice only
+counts if it names a backend that is both <strong>registered</strong> and <code>configured()</code>;
+<code>local</code> is always both, so the chain always terminates.</li><li><strong><code>backendForContainer(row)</code></strong> <em>recalls</em> the one that made an existing
+container, off the row itself. Everything else — target, destroy, helper
+refresh, persist — goes through this, so it keeps addressing the box it
+actually made no matter what the project's setting says now. It deliberately
+checks registration but <strong>not</strong> <code>configured()</code> — revoking a token must not
+strand the machines that backend already owns.</li></ul>
+<p>Selection is a factory-wide <strong>ordered policy</strong> (config key
+<code>compute_backend_policy</code>, the Backends tab on factory settings — see <em>Tiering</em>
+above) plus a per-project override (the Backend select on a project's General
+tab). The older single-value key <code>compute_backend</code> is still read when no policy
+is stored, so a factory that had chosen one backend keeps running on it. The
+credential itself is <strong>env, never the UI</strong> —
+<code>FLY_API_TOKEN</code>, alongside <code>LINEAR_API_KEY</code> and the Twilio secrets — the
+settings page only reports whether a secret is present.</p>
+<p><strong>An unusable selection is a hard stop, not a fallback (AIF-259.)</strong> This chain
+used to degrade to <code>local</code> at every level. That was wrong: a project set to fly
+quietly ran every issue on local docker, so the work &quot;succeeded&quot; in a venue
+nobody chose while the fly dashboard stayed empty. <code>backendFor</code> now returns null
+and the pool refuses to place work, which the engine notes on the issue rather
+than skipping it silently every beat. <code>backendForContainer</code> still falls back,
+deliberately — it addresses a box that already exists, and revoking a token must
+not strand every container that backend owns.</p>
+<h3 id="merge-queues-how-a-pull-request-lands">Merge queues: how a pull request lands</h3>
+<p>A second registration table, deliberately the same shape as the compute one
+above (AIF-307). It answers a different question — compute backends decide
+<strong>where an issue's container runs</strong>, merge queues decide <strong>how its pull request
+lands</strong> — and the two are chosen independently: a project on <code>fly</code> can still
+land through Mergify. <code>src/mergequeue/</code> holds the table; the merge stage hands
+the PR off and stops, and the chosen queue is polled on the beat.</p>
+<div class="table-wrap"><table><thead><tr><th>kind</th><th>what it does</th><th>serializes?</th></tr></thead><tbody><tr><td><code>github</code></td><td>Watches the PR's checks and merges it itself when they are green.</td><td>no — the merge stage's <code>max_per_project: 1</code> is what bounds it</td></tr><tr><td><code>mergify</code></td><td>Hands the PR to Mergify (<code>@mergifyio queue</code>) and watches what Mergify does with it, through GitHub-visible signals only.</td><td>yes — Mergify admits and orders the merges</td></tr></tbody></table></div>
+<p>Both are <code>configured()</code> on <code>GH_TOKEN</code> alone; neither needs a second credential.
+<code>ownsSerialization</code> is what a queue declares about itself, so nothing above the
+seam has to test for a backend by name.</p>
+<p>Selection mirrors the compute chain — a per-project override (the <strong>Merge queue</strong>
+select on a project's General tab, or
+<code>PATCH /api/projects/:id {&quot;merge_queue&quot;:&quot;mergify&quot;}</code>) over a factory-wide default
+(config key <code>merge_queue_backend</code>, the Backends tab on factory settings). A
+backend's declared params are rendered under whichever picker selects it and are
+stored in the project's ordinary <code>params</code> map — <code>mergify_queue</code> is the only one
+today.</p>
+<p><strong>An unusable selection is a hard stop here too</strong>, and for a sharper reason than
+AIF-259's: a project pointed at Mergify whose PRs were quietly landed by the
+factory's own merger has had its queue discipline silently removed. So a
+selection must name a queue that is both registered and configured, or nothing
+lands and the wait fails with the reason on the issue.</p>
+<p>The one asymmetry worth knowing: when <strong>nothing is chosen at either level</strong> the
+chain terminates on <code>github</code> <em>ungated</em> — no <code>configured()</code> check. A factory with
+no <code>GH_TOKEN</code> therefore keeps its pre-AIF-307 behaviour (the poll throws, the
+wait retries next beat) instead of failing the issue outright. Choosing <code>github</code>
+explicitly is validated and can be refused; inheriting it cannot. This is why the
+settings select sends <code>&quot;&quot;</code> rather than <code>&quot;github&quot;</code> for its default option — the
+two are stored differently and resolve differently.</p>
+<p><code>docs/merge-queues.md</code> covers the backends themselves, including what a repo must
+have for Mergify to work and what happens when it does not.</p>
+<h3 id="agent-backends-which-coding-agent-does-the-work">Agent backends: which coding agent does the work</h3>
+<p>A third registration table of the same shape (<code>src/agents/</code>, AIF-392), answering
+the third question: compute backends decide <strong>where</strong> a container runs, merge
+queues <strong>how</strong> its PR lands, agents <strong>who writes the code</strong> — every pipeline
+stage and every conversation turn.</p>
+<div class="table-wrap"><table><thead><tr><th>kind</th><th>what it is</th><th>needs</th></tr></thead><tbody><tr><td><code>claude</code></td><td>Claude Code, exactly as the factory has always run it.</td><td>usually nothing — the container's own login authenticates it</td></tr><tr><td><code>kimi</code></td><td>Kimi (Moonshot), via its Anthropic-compatible endpoint.</td><td><code>KIMI_API_KEY</code></td></tr><tr><td><code>openai</code></td><td>OpenAI, via an Anthropic-compatible gateway the operator runs.</td><td><code>OPENAI_BASE_URL</code> and <code>OPENAI_API_KEY</code></td></tr><tr><td><code>openrouter</code></td><td>OpenRouter, which fronts many providers and serves the Messages API itself.</td><td><code>OPENROUTER_API_KEY</code></td></tr></tbody></table></div>
+<p>The last three are one implementation: a passthrough that points the <code>claude</code> CLI
+at another provider with <code>ANTHROPIC_BASE_URL</code> + <code>ANTHROPIC_AUTH_TOKEN</code>. Because
+that is an env change at the server, no tool or workflow YAML changes when the
+agent does — but a workflow's <code>model:</code> alias does, so <code>runner.ts</code> rewrites
+<code>PARAM_MODEL</code> through the selected backend on the way to the run.</p>
+<p>Unlike the two tables above there is <strong>no per-project override</strong>: one
+factory-wide choice (config key <code>agent_backend</code>, the Agent section of the
+Backends tab), resolved once per run so the credential a run authenticates with
+and the model it is told to use provably come from the same backend. An unusable
+selection is a hard stop here too — the run fails with the reason on the issue
+rather than quietly spending someone else's budget on Claude.</p>
+<p>The <code>github</code> asymmetry repeats exactly: <strong>nothing stored resolves to <code>claude</code>
+ungated</strong>, because a factory whose credential is the container's own
+<code>/data/claude</code> login has no token in its env at all and gating the terminator
+would take every one of those from working to running nothing. Choosing <code>claude</code>
+by name is validated and can be refused.</p>
+<p>A backend's <strong>non-secret settings are stored, not env-only</strong> (AIF-441): its base
+URL and the model it runs for each of the three aliases are per-backend rows in
+the config table (<code>agent_settings:&lt;kind&gt;</code>), edited from the same Backends tab and
+resolved <strong>stored &gt; env var &gt; the registration's default</strong>. API keys are the
+exception and stay env-only, so nothing on that page can carry a credential —
+which is also why the settings write is not gated on the backend being usable:
+for the gateway backend the base URL is what <em>makes</em> it usable.</p>
+<p><code>docs/agent-backends.md</code> covers the backends themselves — the credential per
+backend, the model-alias table, the settings, and how to point a factory at Kimi
+or OpenAI end to end.</p>
+<h3 id="the-fly-backend-and-its-bootstrap">The fly backend, and its bootstrap</h3>
+<p>A fly machine is not a docker container on a host the factory owns, so several
+things differ:</p>
+<ul><li><strong>Image (<code>flyimage.ts</code>).</strong> A machine boots from <code>registry.fly.io/&lt;app&gt;:latest</code>
+and nothing else creates that app or that image, <strong>so a project on the fly
+backend is dead until one publish has happened.</strong> The rebuild loop
+(<code>projectrebuild.ts</code>) does it: with no machine and nothing in the registry
+(<code>backend.imagePublished</code>) it builds and publishes, then stops — there is no
+instance to swap onto. Do not re-gate that path on the project already having
+an instance; that was the deadlock (AIF-260). One app per project
+(<code>FLY_APP_TEMPLATE</code>, default <code>conveyor-{project}-project</code>).</li><li><strong>Warm state (<code>warmimage.ts</code>).</strong> A cold machine would clone the repo and
+install dependencies over the public internet on every issue, so the repo and
+its dependency caches are baked as a layer <em>on top</em>, only on the fly publish
+path — a fly Volume can't do this, since it attaches to one machine at a time
+and isolation here is the machine boundary. Best-effort: a failed warm build
+still publishes the plain image, and the machine just starts cold.</li><li><strong>Machine (<code>fly.ts</code>).</strong> One machine per issue, cut from the image's floating
+<code>:latest</code>, tagged <code>factory_pool</code> / <code>factory_project</code> so the orphan sweep can
+tell its own machines from anything else in the org. <code>pooled()</code> is
+unconditionally true: nothing pre-exists on fly to take over, and since
+AIF-292 there is nothing to take over on the local backend either.</li><li><strong>Reachability (<code>scripts/fly-wg.sh</code>).</strong> <code>target()</code> returns the machine's 6PN
+(fly private network) address. The factory container joins the org's private
+network as a WireGuard peer at boot, from <code>container-init.sh</code>, as root and
+best-effort — which buys arbitrary TCP rather than just SSH, so staging (§3)
+needs no fly-specific code: the stage proxy opens its plain HTTP hop to the
+same 6PN address. If the tunnel is down, switching a project to fly still
+&quot;succeeds&quot; and its machines simply cannot be reached; <code>fly-wg.sh --status</code>
+says which world you're in, <code>fly-check.sh</code> proves the token opens the org's
+Machines API.</li></ul>
+<p>Fly also bills for idle machines, which is why <code>sweepIdleBilledContainers</code>
+exists (<code>CONTAINER_FLY_IDLE_REAP_SEC</code>, default 300). On docker an idle container
+costs nothing and is a warm box for the next issue, so it is only reclaimed
+lazily, when the pool is at the cap and needs the slot. See
+../CLAUDE.md for the operational runbook.</p>
+<h3 id="there-is-no-fallback-a-project-that-cannot-be-built-is-refused-aif-611">There is no fallback — a project that cannot be built is refused (AIF-611)</h3>
+<p>A project used to be able to opt out of the pool — no <code>repo</code> to build from, or
+<code>CONTAINER_POOL=0</code> — and keep running on one long-lived box named by
+<code>projects.ssh_host</code>. That column is gone, along with the flag, the <code>legacy</code>
+allocation result and <code>requiresProjectHost</code>.</p>
+<p>What replaced the fallback is an honest refusal. <code>allocate()</code> answers <code>unusable</code>
+with the reason when the backend will not pool the project (on local that means
+it carries no <code>repo</code>, so there is nothing to build a container FROM), and the
+beat comments that reason on the issue once. <code>resolveTarget</code> and
+<code>resolveSessionTarget</code> return <strong><code>null</code></strong> rather than standing in the project, so
+every caller has to say what it does with &quot;no container yet&quot; — wait, degrade, or
+refuse. That is the point: the old fallback compiled only because <code>Project</code>
+structurally satisfies <code>SshTarget</code>, and what it produced at run time was an SSH
+to <code>''</code> that read as the tool crashing.</p>
+<hr>
+<h2 id="3-standing-up-and-connecting-a-project">3. Standing up and connecting a project</h2>
+<p>Three actors, and it matters which does what.</p>
+<h3 id="from-the-dashboard-add-a-project-with-its-clone-url">From the dashboard — add a project with its clone URL</h3>
+<p>There is no provisioning step for a human to run (AIF-292; <code>scripts/project.sh</code>
+was deleted with it). A project needs a name and a <code>repo</code> param, and the factory
+does the rest the first time an issue asks for a container: <code>create()</code> builds the
+image if this daemon does not have it, then runs a container from it.</p>
+<p>The image is <strong>synthesized</strong> from the factory's <code>project/Dockerfile</code> with the
+repo's <code>.factory/development/Dockerfile</code> fragment appended, <code>project/features.json</code>
+merged with the repo's <code>.factory/development/features.json</code>
+(<code>backends/imagebuild.ts</code>). Everything the factory reads to build the
+<strong>development</strong> container lives under the repo's <code>.factory/development/</code> — clearly
+marked as a factory interface. A repo's own <code>deploy/</code> is its <strong>live-deployment</strong>
+setup and is never read here.</p>
+<p>Devcontainer is used <strong>only as a feature-aware image builder</strong> — no devcontainer
+runtime and no workspace mounts. When the merged feature set is non-empty the
+image is built by the devcontainer CLI (<code>backends/devfeatures.ts</code>, pinned and
+invoked through <code>npx</code>) over the same context; when it is empty the build is a
+plain <code>docker build</code> and no Node download happens. A declared feature that cannot
+be installed <strong>fails the build</strong> — there is deliberately no featureless fallback,
+because a silently featureless image is what AIF-215 was.</p>
+<p>The built image's feature <code>containerEnv</code> is folded into the container (base64 via
+<code>FEATURE_ENV_B64</code>, read by <code>project/container-init.sh</code> into <code>/etc/environment</code>)
+so SSH sessions see it. That is not redundant with the build: the CLI bakes <code>ENV</code>
+only for legacy v1 features, so a v2 feature — every <code>ghcr.io/devcontainers/*</code>
+one — records its <code>containerEnv</code> <strong>only</strong> in the image's <code>devcontainer.metadata</code>
+label, for a runtime we do not run to apply. Both backends read that label off the
+image and pass the result as container env.</p>
+<p>Cross-building (fly) goes through the same CLI with <code>--platform</code>. It shells out to
+<code>docker buildx build</code> and never names a builder, so <code>BUILDX_BUILDER</code> in its
+environment is what selects the <code>aif-cross</code> one — without it the build lands on
+the default builder, which accepts <code>--platform</code>, ignores it, and returns a
+host-architecture image (see §the cross-build note in <code>imagebuild.ts</code>).</p>
+<p>Facts about the repo the factory needs before any container exists — the default
+branch, its HEAD, and the dev-config hash that decides whether an image has
+drifted — are read <strong>straight from the git remote</strong> (<code>repodeploy.ts</code>, one
+<code>git ls-remote</code> plus a bare depth-1 fetch). They used to be read over SSH from the
+project's own container, which is why a project needed one before it could have
+one.</p>
+<p>No project shape needs a box of its own any more: a project with no <code>repo</code> is
+refused rather than run on one — see <em>There is no fallback</em> above.</p>
+<h3 id="inside-the-project-container-projectcontainer-initsh">Inside the project container — <code>project/container-init.sh</code></h3>
+<p>On boot, as root: write env to <code>/etc/environment</code> (PAM loads it for SSH login
+sessions, which is how the factory's non-interactive shells see it), install the
+factory's public key <strong>and</strong> the operator's key into <code>dev</code>'s <code>authorized_keys</code>,
+persist sshd host keys, configure git identity + <code>gh auth setup-git</code>, then
+<strong>clone the repo from its URL</strong> into the <code>~/workspaces</code> volume — a clone, not a
+bind mount, so the container is self-contained — bootstrap an initial commit if
+the repo is empty, run the repo's <code>.factory/development/setup.sh</code> (or a default
+lockfile install), and finally <code>exec sshd -D</code>.</p>
+<h3 id="from-the-web-ui-connect">From the web UI — Connect</h3>
+<p>Registering the project in the dashboard and pressing <strong>Connect</strong> runs
+<code>src/setup.ts</code> over SSH. That is a <em>software</em> install into an already-existing
+container; it provisions nothing. It creates the data-folder tree, <code>scp</code>s the
+helper scripts into <code>&lt;root&gt;/&lt;data&gt;/runtime/bin/</code>, and runs each pipeline tool's
+<code>setup_script</code> (hash-tracked, so it only re-runs when the script changes). A run
+is never launched before its tool's setup has succeeded.</p>
+<p>Connect is rarely needed by hand — the engine's <code>ensureProvisioned</code> does the same
+thing automatically whenever the helper set or a tool's setup script changes.</p>
+<h3 id="launching-a-run">Launching a run</h3>
+<p><code>src/runner.ts</code> writes an <code>ISSUE.md</code> snapshot and the run dir over SSH, then
+launches <code>run-wrapper</code> detached with a composed environment:</p>
+<div class="table-wrap"><table><thead><tr><th>Vars</th><th>Source</th></tr></thead><tbody><tr><td><code>FACTORY_URL</code>, <code>FACTORY_RUN_ID</code>, <code>FACTORY_RUN_TOKEN</code></td><td>callback base + the project's durable bearer token</td></tr><tr><td><code>FACTORY_ISSUE_ID/KEY/TYPE</code>, <code>FACTORY_ISSUE_DIR</code>, <code>FACTORY_DOCS_DIR</code>, <code>FACTORY_RUN_DIR</code></td><td>this issue and run</td></tr><tr><td><code>FACTORY_EXEC_FILE</code></td><td>path of <code>exec.sh</code> in the run dir, holding the tool's <code>exec</code> command (a file, not an env string: one env string is capped at 128 KiB — AIF-648)</td></tr><tr><td><code>PROJECT_*</code></td><td>every project param</td></tr><tr><td><code>PARAM_*</code></td><td>tool defaults overridden by step params</td></tr><tr><td><code>PROPERTY_*</code></td><td>issue properties</td></tr></tbody></table></div>
+<p>Param values are <strong>passed as env only</strong> — never interpolated into the remote
+shell command, so a value cannot break out.</p>
+<p><code>run-wrapper</code> runs <code>bash &quot;$FACTORY_EXEC_FILE&quot;</code>, tails the combined log to the factory every
+~2s, heartbeats when idle, and reports the exit code with retries. It also drops
+a <code>.factory-run</code> marker in the run dir so the helper CLIs still work from a fresh
+shell that lost the environment.</p>
+<h3 id="staging-the-run-button">Staging (the Run button)</h3>
+<p>The factory has no docker daemon of its own for project work, so a stage runs
+<strong>inside the project container</strong>: <code>factory-stage up</code> locates the branch's
+worktree and runs the repo's own executable <code>stage</code> script, whose contract is
+just &quot;start the app and print <code>PORT=&lt;n&gt;</code>&quot;. The factory then proxies one of its
+own stage ports (8080+) to it, giving the staged app a whole origin rather than a
+sub-path. Up to <code>STAGE_MAX_CONCURRENT</code> at once. See staging.md.</p>
+<hr>
+<h2 id="4-what-lives-where-repo-vs-container">4. What lives where — repo vs. container</h2>
+<h3 id="written-by-the-developer-in-the-project-repo-all-optional">Written by the developer, in the project repo (all optional)</h3>
+<p>The factory's <strong>development-container</strong> inputs live under <code>.factory/development/</code> —
+a clearly factory-owned interface. A repo's own <code>deploy/</code> (live deployment) is a
+separate concern the factory never reads.</p>
+<div class="table-wrap"><table><thead><tr><th>File</th><th>Effect</th></tr></thead><tbody><tr><td><code>.factory/development/env</code></td><td>variable overrides; also passed to <code>setup.sh</code> as env</td></tr><tr><td><code>.factory/development/features.json</code></td><td>devcontainer features (strict JSON), merged over the factory default</td></tr><tr><td><code>.factory/development/Dockerfile</code></td><td>extra build steps appended to the default image (a fragment — no <code>FROM</code>)</td></tr><tr><td><code>.factory/development/setup.sh</code></td><td>dev setup run after clone (else a default lockfile install)</td></tr><tr><td><code>.factory/development/compose.override.yaml</code></td><td>ports, mounts, sidecars (service <code>dev</code>)</td></tr><tr><td><code>stage</code></td><td>executable; starts the app and prints <code>PORT=&lt;n&gt;</code> — enables the Run button</td></tr><tr><td><code>CLAUDE.md</code></td><td>instructions the agent reads every run</td></tr></tbody></table></div>
+<p>Samples live in <code>project/examples/</code>.</p>
+<h3 id="deployed-by-the-factory-into-the-container-never-committed">Deployed by the factory into the container, never committed</h3>
+<p>Installed into <code>&lt;root_dir&gt;/&lt;data_folder&gt;/runtime/bin/</code> (default <code>.factory/runtime/bin/</code>)
+and put on the tool's <code>PATH</code>:</p>
+<p><code>run-wrapper</code>, <code>factory-progress</code>, <code>factory-ask</code>, <code>factory-set-status</code>,
+<code>factory-comment</code>, <code>factory-summary</code>, <code>factory-issue</code>, <code>factory-history</code>,
+<code>factory-ready</code>, <code>factory-wait</code>, <code>factory-stage</code>, <code>factory-usage</code>,
+<code>factory-cleanup</code>, <code>factory-persist</code>, <code>factory-checkpoint</code>, <code>factory-pr</code>,
+<code>factory-reintegrate</code>, <code>factory-git-auth</code>.</p>
+<p>The list itself lives in <code>HELPERS</code> (<code>src/setup.ts</code>); that array is what
+<code>ensureProvisioned</code> hashes, so adding one is enough to push it to every project.</p>
+<p><code>factory-persist</code> and <code>factory-checkpoint</code> are two halves of one guarantee: work
+must not live on only one container. Persist pushes every committed branch and
+deliberately invents no commit; checkpoint makes the <code>wip:</code> commit that gives it
+something to push (AIF-263). The dev-agent checkpoints after every failed attempt
+at a stage, and the pool checkpoints immediately before persisting a container it
+is about to release — so an uncommitted edit is saved at the last moment it can
+be, rather than reported as <code>PERSIST_DIRTY</code> and lost with the box. The commits sit
+on the issue's own branch and are squashed away when its PR merges.</p>
+<p><code>factory-pr land &lt;repo-root&gt; &lt;branch&gt; &lt;base&gt;</code> is what the Merge stage uses to
+put a branch on the base branch: it pushes, opens (or reuses) the PR, waits for
+its checks and squash-merges when they are green (AIF-197). It speaks the GitHub
+REST API with <code>curl</code> + <code>$GH_TOKEN</code> rather than <code>gh</code>, which arrives as a
+devcontainer feature and so is absent from any container built before AIF-215 —
+and from a legacy project the factory does not build at all. Exit 3 means the
+origin is not on GitHub, and the stage falls back to a local merge + push.</p>
+<p>These are baked into the factory image and re-<code>scp</code>'d whenever they change.</p>
+<h3 id="baked-into-the-project-image">Baked into the project image</h3>
+<p>Node, Claude Code, TypeScript, <code>curl</code>, and <code>gh</code> (from the default devcontainer
+feature); <code>sshd</code> running as user <code>dev</code>. Tool <code>setup</code> scripts install anything
+else a specific tool needs. The wrapper additionally requires <code>bash</code>, <code>curl</code>,
+coreutils, <code>ps</code> and <code>setsid</code>.</p>
+<h3 id="persistent-volumes-on-the-project-container">Persistent volumes on the project container</h3>
+<p>The repo checkout at <code>/home/dev/workspaces/&lt;name&gt;</code> and the one-time Claude login
+at <code>/data/claude</code> are per-container named volumes, so an image rebuild swaps the
+container without losing the workspace or the login. <strong>Per-container</strong> is exact:
+the volumes are named after the container that owns them (<code>volumesFor</code>), so each
+issue's container gets its own checkout and teardown removes precisely those.</p>
+<hr>
+<h2 id="5-committed-vs-runtime-only">5. Committed vs. runtime-only</h2>
+<p>This is the rule the on-disk layout exists to enforce: <strong>the factory writes a lot
+into the project checkout, and almost none of it is tracked.</strong> The split is a
+single directory boundary under the project's <code>data_folder</code> (default <code>.factory/</code>).</p>
+<div class="code"><pre><code>&lt;root_dir&gt;/
+  .factory/
+    .gitignore                       ← contains exactly: runtime/
+    issues/&lt;issue-id&gt;/documents/     ← TRACKED. stage docs, committed onto the branch
+    documents/                       ← TRACKED (opt-in). central project docs
+    runtime/                         ← IGNORED WHOLESALE. everything below here
+      bin/                             the helper scripts
+      issues/&lt;issue-id&gt;/
+        ISSUE.md                       the snapshot a tool reads
+        .claude-session                session id for stage-to-stage resume
+        documents/                     the working docs a stage writes
+        runs/&lt;run-id&gt;/                 output.log, prompt.txt, agent.out, usage.txt, .factory-run</code></pre></div>
+<p><code>src/paths.ts</code> is where this lives. Note the deliberate asymmetry: the tracked
+docs dir (<code>.factory/issues/&lt;id&gt;/documents</code>) is a <strong>sibling</strong> of <code>runtime/</code>, which
+is what lets one <code>runtime/</code> ignore line cover every runtime artifact without also
+ignoring the documents.</p>
+<h3 id="what-the-factory-commits">What the factory commits</h3>
+<p>On a <strong>successful</strong> non-<code>merge</code> stage that has a worktree, the <code>dev-agent</code> tool:</p>
+<ol><li>rewrites <code>.factory/.gitignore</code> to <code>runtime/</code> (in place, so existing projects
+migrate);</li><li>copies <code>$FACTORY_DOCS_DIR/*.md</code> → <code>.factory/issues/&lt;id&gt;/documents/</code>;</li><li><code>git add -A</code> and commits as <code>AI Factory &lt;factory@users.noreply.github.com&gt;</code>
+with message <code>&lt;phase&gt;: &lt;slug&gt;</code>;</li><li><code>git push -u origin &lt;branch&gt;</code> and comments on the issue whether it worked.</li></ol>
+<p>So a branch carries the real code changes <strong>plus</strong> that issue's stage documents
+(<code>PRD.md</code>, <code>ARCHITECTURE.md</code>, <code>JDI.md</code>, <code>REVIEW.md</code>, …), and nothing else the
+factory generated.</p>
+<p>Optionally — per project, via <code>manage_project_docs</code> — the <strong>review</strong> stage also
+reconciles central docs at <code>.factory/documents/</code> (<code>features.md</code>, <code>design.md</code>,
+<code>api.md</code>, <code>architecture.md</code>). Only when accepting and advancing, never when
+pushing back. These describe the project <em>as it is now</em>; they are not a
+changelog. <code>FACTORY_PROJECT_DOCS_DIR</code> is passed <strong>relative</strong> to the repo root on
+purpose — the agent's CWD is the worktree, and an absolute path would land edits
+in the main checkout, off-branch.</p>
+<p>Each of those four documents is held to a line budget (<code>doc_budget_lines</code>, 600
+by default; a project raises it with a project param of the same name) and opens
+with a one-line-per-section map, and the reviewer is told each file's current
+size and to compact rather than append past it. The whole clause is skipped when
+the branch's diff touches only tests, <code>docs/</code>/top-level markdown, or <code>.factory/</code>
+— an objective path check in <code>dev-agent</code>, not something the agent is asked to
+judge. (<code>big_task</code> reconciles too, since it contains its own review.)</p>
+<h3 id="what-is-never-committed">What is never committed</h3>
+<p>Everything under <code>runtime/</code>: the <code>ISSUE.md</code> snapshot, run logs and prompts,
+per-run scratch, <code>.factory-run</code> markers, the installed helper <code>bin/</code>, stage
+bookkeeping, and the <code>.claude-session</code> id (machine-local, and outside
+<code>documents/</code> specifically so the doc-copy can't sweep it into a commit). The
+result is that a project's checkout never accrues dirty state from the factory
+operating on it.</p>
+<h3 id="branch-and-worktree-lifecycle">Branch and worktree lifecycle</h3>
+<p>Each issue works on <strong>its own branch</strong>, <code>issue/&lt;key&gt;-&lt;slug&gt;</code>, forked from
+<code>PROJECT_BASE_BRANCH</code> (default <code>main</code>). <em>Where</em> that branch is checked out
+depends on whether the issue owns its container (AIF-149):</p>
+<ul><li><strong>it does</strong> (the normal case since AIF-139) — the branch is checked out in the
+container's <strong>main checkout</strong>. Nothing else runs in this container, so there is
+nobody to clash with, and the checkout a human SSHes into is the one the agents
+actually used;</li><li><strong>it doesn't</strong> (an unpooled project, whose issues share one container) — the
+stage forks an isolated worktree at
+<code>&lt;parent&gt;/.factory-worktrees/&lt;repo&gt;/&lt;key&gt;</code>, or two concurrent stages would
+fight over one working tree.</li></ul>
+<p>An issue that <em>already</em> has a worktree keeps it even on a dedicated container: it
+may hold uncommitted work, and moving an in-flight issue would strand it.</p>
+<p>Beyond that:</p>
+<ul><li>the checkout is created idempotently by the first stage that needs it and
+reused by every later stage of that issue;</li><li>a branch that exists only on <strong>origin</strong> is fetched first, and a missing
+<code>$BRANCH</code> is cut from <code>origin/$BRANCH</code> in preference to the base — a stage can
+resume on a container that has never seen the branch (see the hold sweep
+above), and cutting from the base would silently abandon the work;</li><li>a stage with <code>workspace: none</code> (e.g. the <code>plan</code> phase) skips all of this and
+runs read-only in the main checkout — nothing is committed or pushed, though
+its documents still land in <code>FACTORY_DOCS_DIR</code> for the dashboard;</li><li>the <strong>merge</strong> phase runs from the repo root with explicit <code>git -C</code>, because it
+may remove the worktree — <code>cd</code>-ing in first would delete its own CWD. It only
+removes one when the worktree and the repo root are genuinely different
+directories;</li><li>cancelling an issue cleans up its branch and worktree (<code>src/cleanup.ts</code>), and
+releases its container.</li></ul>
+<h2 id="6-epics-and-landing-one-as-a-branch">6. Epics, and landing one as a branch</h2>
+<p>An epic is an issue of type <code>epic</code> — same <code>issues</code> row, key, thread,
+documents, properties — not a table of its own (AIF-487). Members point at
+it with <code>epic_id</code>; an epic cannot itself belong to another epic. A workflow
+that declares no <code>epic</code> type has no epics, which is the signal the dashboard
+uses to hide the tab. Running an epic means the scheduler promotes members,
+in the epic's manual order, to their type's hand-off status, keeping
+<code>EPIC_ISSUE_PROCESSING_LIMIT</code> in flight — but it no longer decides an epic is
+<em>finished</em>: once every member is terminal the epic sits on <code>in_progress</code> and
+waits for a human's <strong>Approve</strong>.</p>
+<p><code>epic_branch</code> is an issue property (<code>types: [epic]</code>), off by default:</p>
+<div class="table-wrap"><table><thead><tr><th><code>epic_branch</code></th><th>Members fork from / land on</th><th>Approve closes to</th></tr></thead><tbody><tr><td>off</td><td>the project's own base branch</td><td><code>done</code>, directly (the beat, no pipeline step)</td></tr><tr><td>on</td><td><code>epic/&lt;key&gt;-&lt;slug&gt;</code></td><td><code>testing -&gt; updating -&gt; merging -&gt; done</code></td></tr></tbody></table></div>
+<ul><li>The branch name, <code>epic/&lt;key&gt;-&lt;slug&gt;</code> (<code>epicBranchName()</code> in <code>epics.ts</code>), is
+a contract with <code>ci.yml</code>'s <code>pull_request</code> filter (below) — both have to
+agree on the pattern.</li><li>The server computes it once per issue and hands it to dev-agent as
+<code>FACTORY_BASE_BRANCH</code> (the same var the project's own base branch already
+used), which is what makes the fork point, update-to-latest, the merge
+step and factory-pr's PR base all move together. Flipping the box only
+affects work that hasn't landed yet.</li><li>The branch is cut by the epic's <strong>first member that needs it</strong>, not the
+server (which has no checkout) — forked off the project's base branch and
+pushed. A push origin refuses falls back to the project's base branch
+rather than working against a base GitHub would later refuse a PR into.
+That fallback is reported on <strong>that member's own thread, not the epic's</strong> —
+<code>factory-comment</code> posts to the issue whose run is speaking — so an epic
+whose members quietly landed on the base branch shows nothing on its own
+thread to say why.</li><li>The epic issue's own work IS that branch: it reaches dev-agent/test-runner
+as a second var, <code>FACTORY_WORK_BRANCH</code> (&quot;&quot; for everything else). dev-agent
+<strong>checks it out and never creates it</strong> — since a member cuts it first, a
+missing branch here means the usual fall-through would cut a fresh one off
+base and open a PR that reverts every member's work, so it stops instead.</li><li>The fork on Approve lives in the beat (<code>epicrun.ts</code>'s
+<code>settleApprovedEpics</code>), not a pipeline step: a step is keyed by
+<code>(type, status)</code> alone, so one on <code>approved</code> would fire for a branchless
+epic too and race the close. <code>testing</code> tests the whole epic branch as ONE
+tree — something no member's own test run does; <code>updating</code> folds in a
+moved base and opens the PR; <code>merging</code> waits on the queue. It shares
+<code>queue: merge</code> with ordinary member merges (AIF-250) — one per-project
+slot for both.</li><li>Two knobs in that pipeline look like oversights and are not. The <code>Testing</code>
+step sets <code>auto_approve_status: &quot;&quot;</code> <strong>explicitly</strong>, because it defaults to
+<code>approved</code> — and on an autopilot epic a green run would jump there, straight
+back into the beat's fork, which would send it to <code>testing</code> again forever. A
+human already approved this epic; there is no second gate to skip. And the
+epic type's <code>error</code> status — where the landing flow parks an epic it cannot
+proceed with at all, no branch on origin or no test script — is declared
+<em>after</em> <code>done</code> on purpose. <code>runningEpicStatus()</code> derives &quot;the status that
+means the factory is working this epic&quot; as the FIRST active-category status
+by sort, and does not skip parked ones; <code>error</code> shares <code>in_progress</code>'s
+<code>implementation</code> category, so declaring it earlier would make <em>it</em> that
+status, pointing the member scheduler and the dashboard's Start button at
+<code>error</code> instead of <code>in_progress</code>.</li></ul>
+<p><strong>A project turning <code>epic_branch</code> on needs its own CI to match.</strong> <code>ci.yml</code>'s
+<code>pull_request</code> trigger matches the PR's <em>base</em> branch, so a member's PR into
+<code>epic/&lt;key&gt;-&lt;slug&gt;</code> is checked only if that filter includes <code>epic/**</code> (this
+repo's does: <code>branches: [main, &quot;epic/**&quot;]</code>). Skip it on another project and
+such a PR gets no checks at all — nothing red, because nothing ran — so
+<code>green-gate</code> never appears, Mergify's <code>check-success=green-gate</code> is never
+satisfied, and the issue sits on <code>merging</code> forever with nothing to point at.</p>
+<h2 id="7-specialists-a-standing-agent-that-files-its-own-epics">7. Specialists: a standing agent that files its own epics</h2>
+<p>A <strong>specialist</strong> is a long-running domain expert attached to a project — one
+quality (performance, accessibility, architecture, test health, security,
+docs…) watched continuously. On a cadence it evaluates the codebase, records
+what it believes is wrong, files issues for the fixes, and lets the ordinary
+pipelines implement them. You set it up once, then check in to see what it did.</p>
+<p>It is its <strong>own entity</strong> — a <code>specialists</code> row, its own page and nav item, its
+own key from the same per-project sequence issues and epics draw from, its own
+comment thread — that <em>creates and manages</em> epics as the visible unit of its
+work. Every epic it opens is completely ordinary: normal members, normal branch
+(§6), normal Approve, normal summary, normal close to <code>done</code>. <strong>Nothing about
+epics changes.</strong> Everything specific to standing work — charter, budget,
+autonomy, WIP, cadence, the findings ledger, the report — lives on the
+specialist, which is what keeps it out of the epic.</p>
+<p>It is also deliberately <strong>not an issue row</strong> of some <code>type: specialist</code>. A
+specialist has no workflow status machine, no pipeline and no place on a board,
+so being an issue would mean hiding it from every issue surface — and each of
+those exclusions is a future bug.</p>
+<blockquote><p><strong>The design that was dropped.</strong> The specialist used to <em>be</em> a long-lived epic
+that never closes, with a custom <code>evaluating</code>/<code>paused</code>/<code>over_budget</code> track
+bolted onto the epic type. Because one epic branch had to survive being
+squash-merged into <code>main</code> over and over, it needed a freeze → re-cut → replay
+→ force-push dance to stay alive. Making the specialist its own entity removed
+the <em>need</em> for all of it: it opens a fresh ordinary epic, works it, lands it
+through the unmodified Approve flow, and opens the next one. There is no git
+mechanic here at all.</p></blockquote>
+<h3 id="domains">Domains</h3>
+<p>A <strong>domain</strong> is the area of the product an issue is work on — a per-project tag
+on a real column (<code>issues.domain_id</code>, <code>domains</code> table), not a workflow property,
+so it filters and indexes everywhere. <code>null</code> is ordinary human work. The slug is
+the handle and is never silently suffixed (a collision is a 409); <code>none</code> is
+reserved as the filter word for &quot;no domain at all&quot;. An unknown domain <strong>narrows
+to an empty list</strong> on a filter but is a <strong>400 on a write</strong> — a dropped tag on a
+create is silent data loss where an empty list is visibly empty.</p>
+<p>Inheritance is <strong>resolved server-side, and the two callers are not symmetric</strong>:</p>
+<div class="table-wrap"><table><thead><tr><th>Caller</th><th>Rule</th></tr></thead><tbody><tr><td>an agent on a run token (<code>issueapi.ts</code>)</td><td>a <code>domain</code> in the request is <strong>ignored</strong>. The answer is the domain of the issue this run is <em>for</em>, else that issue's epic's, else the epic the new issue is filed into.</td></tr><tr><td>a human (dashboard, public API)</td><td>an explicit choice always wins — including a deliberate <em>none</em>. Inheritance only fills a blank.</td></tr></tbody></table></div>
+<p>Caller lineage first is what makes the agent rule &quot;you cannot escape your
+domain&quot; rather than &quot;you pick a domain by choosing an epic&quot;. A domain nobody
+chose is explained on the new issue's thread, folded into the creation note.</p>
+<p><strong>Epic ownership inheritance</strong> is the same argument one level up: an agent
+working inside a specialist's epic — on the epic or on a member — files its
+follow-ups into that same epic, because a follow-up that escapes it escapes the
+WIP cap and the budget with it. Scoped to specialist-owned epics only (a plain
+epic keeps today's loose behaviour), and unlike the domain an explicit <code>--epic</code>
+<strong>wins</strong> rather than being ignored, since it only fills a gap.</p>
+<h3 id="epic-ownership-and-succession">Epic ownership and succession</h3>
+<p>The link is <code>issues.specialist_id</code> — <strong><code>issues</code>, not <code>epics</code></strong>: an epic <em>is</em> an
+issue (§6), and the legacy <code>epics</code> table has been unread since schema v43. It is
+set only on epic rows. <code>specialists.active_epic_id</code> is the other half of the
+same fact, and <code>setActiveEpic()</code> writes both in one transaction, because
+splitting that write across callers is how halves drift.</p>
+<p>A specialist has <strong>at most one active epic</strong> — the one new findings are filed
+into. Clearing the pointer drops the specialist's side only: the epic keeps its
+<code>specialist_id</code>, which is a fact about who created it that stays true after the
+specialist moves on, and is what lets a landed epic still be attributed.</p>
+<p>Succession is one decision (<code>decideSuccession</code>) and runs on the beat: the landed
+epic is cleared on the beat that notices. The beat never opens the replacement
+(AIF-642) — the first member a cycle files does (<code>openEpicForFiling</code>, inside the
+create route, after every check has passed), so a cycle that finds nothing leaves
+no empty epic behind. A halted specialist
+does nothing at all — not even the bookkeeping clear, because that would discard
+the one fact a returning operator needs. The new epic is named <code>&lt;name&gt; — pass
+&lt;n&gt;</code>, carries the specialist's domain, and gets <code>epic_branch</code> from the
+specialist's <code>landing</code>. Landing itself is the <strong>unmodified Approve flow</strong>; the
+epic-cadence policy can only ever <em>delay</em> that moment, never bring it forward.</p>
+<h3 id="the-evaluation-cycle">The evaluation cycle</h3>
+<p>A cycle is a <strong>standalone run attached to no issue</strong>. It needs the whole run
+apparatus — detached launch, heartbeats, output capture, the <code>factory-*</code>
+helpers, usage and cost — but must be invisible as an issue, so it gets an
+ordinary <code>runs</code> row whose <code>issue_id</code> holds <strong>the specialist's own uuid</strong>. That
+is precedent, not a trick: the thread is keyed to <code>comments</code> the same way. What
+falls out of it is the good part — invisibility is <em>structural</em>, because every
+issue-scoped query either filters <code>issue_id=?</code> or INNER JOINs <code>issues</code>, so a
+cycle run holds no step slot and cannot surface as an issue; and the helpers
+work unchanged, since <code>factory-comment</code> posts to <code>addComment(run.issue_id, …)</code>
+which <em>is</em> the specialist's thread. <code>step_id</code> is deliberately empty so a clean
+exit does not try to bump the status version of an issue that does not exist.</p>
+<p>The due check reports the <strong>first</strong> gate that applies, in the order an operator
+would ask them: <code>disabled</code> → <code>in_cycle</code> → <code>halted</code> → <code>wip</code> → <code>interval</code> →
+<code>quiet</code> → <code>unchanged</code>. <strong>Run now</strong> records a durable request and the <em>beat</em>
+starts it (two launch paths is how a button and a due check come to disagree),
+and it bypasses only the last three — budget, pause, retirement and the WIP cap
+are all somebody having said stop. Probes run server-side <em>before</em> the agent,
+because their output is one of the prompt's inputs.</p>
+<p>The <strong>findings ledger</strong> is keyed <code>(specialist, fingerprint)</code> — not to the epic
+it was found in, which is the whole reason a ledger exists instead of just issue
+bodies: a fingerprint has to survive an epic landing and the next one opening.
+Evidence is required (an opinion recorded as a finding is what makes a ledger
+unreadable after a month), and a <strong>rejected fingerprint needs <code>new_evidence</code> to
+come back</strong>, or a specialist would argue with its operator forever. Decisions —
+and only decisions — append to <code>specialist_finding_events</code>, so a
+reject → re-open → reject keeps both reasons.</p>
+<p>A cycle that found nothing doubles the interval (<code>consecutive_noops</code>), capped at
+a week. The cap is on the <strong>result</strong>, not the multiplier, so an operator who
+configured a longer interval is never stretched past it by the backoff.</p>
+<h3 id="governance-autonomy-wip-budget">Governance: autonomy, WIP, budget</h3>
+<p><code>status</code> is where the machine is; <code>enabled</code> is what the <strong>operator</strong> asked for.
+They are separate so a specialist parked <code>over_budget</code> still remembers it is
+wanted, and comes back on its own. <code>active</code> and <code>evaluating</code> are <em>going</em>;
+everything else (<code>paused</code>, <code>over_budget</code>, <code>error</code>, <code>retired</code>) is <strong>halted</strong>, and
+halted means no promotion, no landing, no succession.</p>
+<div class="table-wrap"><table><thead><tr><th>Axis</th><th>Effect</th></tr></thead><tbody><tr><td><code>autonomy</code></td><td><code>propose</code> files members for a human to release and needs a human to land; <code>auto</code> lets the scheduler promote and land. Halted beats both — but <code>propose</code> is not a halt, so a human releasing a member by hand still works.</td></tr><tr><td><code>max_running_members</code></td><td>How many members may <em>execute</em> at once. Counted in <strong>runs, not statuses</strong> — a human bulk-releasing ten members would otherwise read as ten against a cap of one and deadlock every one of them.</td></tr><tr><td><code>max_open_members</code></td><td>How much may be <em>open</em> in the active epic. A read the cycle asks before filing, not a gate: a human may hand-file past it.</td></tr><tr><td>background priority</td><td>Specialist work sorts behind every issue a human is waiting on. <strong>Stable</strong>, and nothing is filtered — with the pool free everything still launches this beat, just in a different order.</td></tr></tbody></table></div>
+<p>The <strong>budget ledger spans everything the specialist has ever cost</strong>: its own
+cycle runs <em>and</em> every epic it has created, current and landed. That falls out
+of one join (<code>COALESCE(i.epic_id, i.id)</code> resolves a member to its epic and an
+epic to itself, plus a second arm for the issue-less cycle run) rather than
+needing a history table. Periods are <strong>calendar-aligned in UTC</strong> — a trailing
+window has no boundary, and both &quot;warn once per period&quot; and &quot;back to <code>active</code>
+when the window rolls&quot; need one. <code>0</code> means no cap.</p>
+<p><strong>Enforcement is at stage boundaries, so a single run can overshoot the cap by
+one run.</strong> That is a real property, not a rounding error: spend is only known
+once a run reports its usage, so a run that started under the cap can end over
+it. The UI says so in its footnote and shows the overshoot unclamped — &quot;125% of
+$50.00&quot; is the fact an operator needs; clamping to 100% would hide how far past
+it went. <code>on_exhaust</code> then decides what happens to work already moving:
+<code>finish_in_flight</code> (default) lets it finish, <code>pause_all</code> stops it at the next
+stage boundary. Either way a member that has <strong>never run</strong> is refused, because
+<code>finish_in_flight</code> is a promise about work already started, not a licence to
+start more — and the epic's own landing pipeline is exempt, since by then the
+money is spent and refusing to land would strand every member's work.</p>
+<p>Separately, <code>protected_paths</code> is a fence on <em>what it may change</em>. The filing
+side tells the agent never to open work inside one; the scripted Testing stage
+checks what the branch actually changed, <strong>before</strong> the suite (a green run
+printed under a violation reads as approval of it) and <strong>parks</strong> the issue at
+<code>blocked</code> rather than bouncing it — this is not something an agent iterates on.
+The whole block is skipped when <code>FACTORY_PROTECTED_PATHS</code> is empty, which is
+every issue no specialist owns, and that guard is what makes it safe to put in a
+file every issue in the factory runs.</p>
+<h3 id="the-report">The report</h3>
+<p>The specialist's report rolls up <strong>what it has changed across every epic it has
+ever opened</strong>. Only <em>history</em> is stored: each landing freezes the epic's own
+write-up, each member's closing summary and the finding that justified it. The
+scorecard, what is in flight and what was turned down are <strong>computed on every
+read</strong> from rows the cycle already keeps — so a cycle refreshes them by doing
+its ordinary work, and a human rejecting a finding an hour later shows up at
+once rather than next cycle.</p>
+<p>Every displayed string is <strong>frozen at landing and nothing on the read path joins
+back for text</strong>; ids are kept beside the frozen keys so links work while the
+rows live. Text frozen, links live — turning either back into a join would make
+a two-month-old report rewrite itself. No agent writes any of it: the only
+agent-authored words are the cycle's own summary line.</p>
+<p>&quot;Show me the delta since I last looked&quot; is <strong>nothing more exotic than epics of
+mine that landed since your last visit</strong> — a per-user <code>last_viewed_at</code> mark, and
+never a filter on what is shown (the report reads the same for everyone; the
+mark drives the badge). An empty mark honestly reads as &quot;all of it is new&quot;.
+<code>?since=last_integration</code> narrows the history to the most recent landing.</p>
+<h3 id="gotchas">Gotchas</h3>
+<ul><li><strong><code>issues.specialist_id</code>, never <code>epics.specialist_id</code>.</strong> The legacy table is
+unread; writing there sets a field nothing reads.</li><li><strong>A run may have no issue.</strong> Three places had to learn it — the cost ledger's
+attribution join, <code>specialistOwningRun</code> (so a cycle ending rechecks the
+budget), and <code>reapIfDead</code> (so a dead cycle is reaped instead of leaving the
+specialist <code>evaluating</code> for good). A fourth caller that assumes <code>getIssue(
+run.issue_id)</code> is non-null is the next bug of this shape.</li><li><strong>In that ledger, <code>e.type = 'epic'</code> sits in the JOIN condition, not a WHERE.</strong>
+As a WHERE clause it throws the issue-less cycle arm away again — the one
+mistake the query's shape invites.</li><li><strong>The one-specialist-per-domain index is PARTIAL</strong> (<code>WHERE status &lt;&gt;
+'retired'</code>). It has to mean one <em>live</em> one, or retiring would burn the domain
+forever — retirement being the only exit the table offers.</li><li><strong>Read <code>status</code>, not <code>enabled</code>, to decide whether it may act</strong>, and remember
+<code>error</code> is in the halted set (the issue's own summary of the track omits it).</li><li><strong>The interval backoff caps the result, not the exponent.</strong> Clamping the
+exponent tightly silently becomes the real limit, and &quot;capped at a week&quot;
+quietly stops being true for every short interval — which is exactly the bug
+its test found.</li><li><strong>Turning <code>branch</code> landing off is refused while the active epic still holds
+unlanded work.</strong> The epic's own <code>epic_branch</code> cannot move with it (members
+have already opened PRs against that branch), so the switch would leave the
+specialist claiming per-member landing while its epic accumulates onto a
+branch nobody will land. <code>abandonActiveEpic</code> is the way through, and it leaves
+the epic alone — not cancelled, not deleted — because a half-finished epic
+that still exists is something a human can finish by hand.</li><li><strong>Retirement is terminal and refuses to strand work</strong>, unless asked to abandon.</li><li><strong>A cycle's thread writes land on the specialist, not an issue</strong>, which is
+what lets an operator watch work appear on the page they are already on.</li></ul>
+<h3 id="dogfooding-it-on-this-repo">Dogfooding it on this repo</h3>
+<p>The eight built-in templates (<code>config/specialist-templates/builtin.yaml</code>, read
+from disk on demand — they only pre-fill the New-specialist dialog, so there is
+no row to keep in step) include <strong>Architecture</strong> and <strong>Accessibility</strong>, either
+of which is a good first specialist here. A sensible first setup:</p>
+<ul><li><strong>Landing <code>branch</code></strong>, so each pass accumulates on <code>epic/&lt;key&gt;-&lt;slug&gt;</code> and
+lands as one reviewable unit. This repo's <code>ci.yml</code> already matches <code>epic/**</code>,
+which §6 warns is the thing another project has to add.</li><li><strong>Autonomy <code>propose</code></strong> — set it <em>explicitly</em>, because <code>branch</code> landing
+defaults it to <code>auto</code>. You want to read the first few passes before the
+scheduler promotes and lands on its own.</li><li><strong>A modest weekly budget</strong> (<code>budget_period: week</code>, a low <code>period_budget_usd</code>),
+which bounds the experiment whatever else is misconfigured. Remember it can
+overshoot by one run.</li><li>Leave the daily <code>min_interval_min</code> (1440) and <code>only_when_changed</code> alone, and
+keep <code>max_open_members</code> small.</li></ul>
+<p>A specialist is created <strong>paused</strong> and disabled whatever else you pass, so
+nothing runs until you resume it.</p>
+<hr>
+<h2 id="where-to-read-more">Where to read more</h2>
+<div class="table-wrap"><table><thead><tr><th>Topic</th><th>Doc</th></tr></thead><tbody><tr><td>The delivery pipeline, stage by stage</td><td>workflow.md</td></tr><tr><td>Status/workflow mechanics</td><td>statuses-and-workflows.md</td></tr><tr><td>Running on fly.io</td><td><a href="#2-containers-one-per-issue-from-a-pool">§2 above</a>, then the runbook in ../CLAUDE.md</td></tr><tr><td>Merge queues</td><td>merge-queues.md</td></tr><tr><td>Agent backends (Kimi, OpenAI)</td><td>agent-backends.md</td></tr><tr><td>Self-deploy / CI runner</td><td><a href="self-deploy.html">self-deploy.md</a></td></tr><tr><td>Running a branch</td><td>staging.md</td></tr><tr><td>Ad hoc conversations</td><td>conversation.md</td></tr><tr><td>Linear sync</td><td><a href="linear-sync.html">linear-sync.md</a></td></tr><tr><td>Specialists (API surface)</td><td>api.md</td></tr><tr><td>Agent git conventions</td><td>../github/WORKFLOW.md</td></tr><tr><td>Quick start + operating</td><td><a href="docs.html">../README.md</a></td></tr></tbody></table></div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="foot">
+  <div class="wrap foot-inner">
+    <p class="foot-brand">Conveyor<span class="dot">.</span>AI</p>
+    <nav class="foot-links" aria-label="Documentation">
+      <a href="docs.html">Docs</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="self-deploy.html">Self-deploy</a>
+      <a href="linear-sync.html">Linear sync</a>
+      <a href="privacy.html">Privacy</a>
+      <a href="messaging.html">Messaging</a>
+    </nav>
+    <p class="foot-note">A factory for software work.</p>
+  </div>
+</footer>
+
+</body>
+</html>

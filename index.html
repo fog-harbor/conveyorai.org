@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Conveyor.AI — from issue to pull request, automatically</title>
+<meta name="description" content="Conveyor.AI is a long-running factory that drives every issue through your pipeline — planning, implementation, review, tests and a pull request — with coding agents working in an isolated container per issue.">
+<meta property="og:title" content="Conveyor.AI — from issue to pull request, automatically">
+<meta property="og:description" content="Describe the work. Agents plan it, build it, review it, test it and open the PR — each issue in its own container, every stage streaming live.">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b8dff'/%3E%3Crect x='12' y='9' width='9' height='9' rx='2' fill='%230c0e12'/%3E%3Cpath d='M8 22h16' stroke='%230c0e12' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="nav" id="top">
+  <div class="nav-inner">
+    <a class="brand" href="#top">
+      <svg class="mark" viewBox="0 0 32 32" role="img" aria-label="Conveyor.AI">
+        <defs>
+          <linearGradient id="cmark" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#6f9bff"/>
+            <stop offset="1" stop-color="#8b5cf6"/>
+          </linearGradient>
+        </defs>
+        <rect width="32" height="32" rx="8.5" fill="url(#cmark)"/>
+        <rect x="11.5" y="8" width="9" height="9" rx="2" fill="#0b0d11"/>
+        <path d="M7.5 21.5h17" stroke="#0b0d11" stroke-width="2.2" stroke-linecap="round"/>
+        <circle cx="11" cy="25" r="1.7" fill="#0b0d11"/>
+        <circle cx="16" cy="25" r="1.7" fill="#0b0d11"/>
+        <circle cx="21" cy="25" r="1.7" fill="#0b0d11"/>
+      </svg>
+      <span class="wordmark">Conveyor<span class="dot">.</span>AI</span>
+    </a>
+
+    <nav class="nav-links" aria-label="Sections">
+      <a href="#how">How it works</a>
+      <a href="#features">Features</a>
+      <a href="#pipeline">Pipeline</a>
+      <a href="#config">Config</a>
+    </nav>
+
+    <a class="btn btn-primary btn-sm" href="#start">Get started</a>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- ── hero ─────────────────────────────────────────────────────────── -->
+  <section class="hero">
+    <div class="wrap hero-grid">
+      <div class="hero-copy">
+        <p class="eyebrow"><span class="pip"></span> Agent-driven delivery pipelines</p>
+        <h1>From issue to pull request, <span class="grad">automatically</span>.</h1>
+        <p class="lede">
+          Conveyor.AI is a single long-running factory that drives every issue through
+          your pipeline — planning, implementation, review, the test gate, the PR — with
+          coding agents working in their own isolated container, one per issue.
+        </p>
+        <div class="cta-row">
+          <a class="btn btn-primary" href="#start">Get started</a>
+          <a class="btn btn-ghost" href="#how">See how it works</a>
+        </div>
+        <ul class="hero-facts">
+          <li>One container per issue</li>
+          <li>Pipelines declared in YAML</li>
+          <li>Runs on Docker or Fly.io</li>
+        </ul>
+      </div>
+
+      <!-- A picture of the product: one issue, mid-pipeline, streaming. -->
+      <div class="hero-visual" aria-hidden="true">
+        <div class="win">
+          <div class="win-bar">
+            <span class="tl"></span><span class="tl"></span><span class="tl"></span>
+            <span class="win-title">AIF-321 · Home page</span>
+          </div>
+
+          <div class="rail">
+            <span class="stage done">Intake</span>
+            <span class="stage done">Planning</span>
+            <span class="stage live">Implementation</span>
+            <span class="stage">Review</span>
+            <span class="stage">Testing</span>
+            <span class="stage">Merge</span>
+          </div>
+
+          <div class="log">
+            <p><span class="lt run">run</span> dev-agent · issue/aif-321-home-page</p>
+            <p><span class="lt ok">ok</span> container reserved · worktree ready</p>
+            <p><span class="lt ok">ok</span> 14 files read · branch cut from origin</p>
+            <p><span class="lt work">…</span> writing index.html<span class="caret"></span></p>
+          </div>
+
+          <div class="ask">
+            <p class="ask-q">Should the primary button link to the docs or the quick start?</p>
+            <p class="ask-a">Quick start<span class="ask-hint">↵ answer</span></p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── how it works ─────────────────────────────────────────────────── -->
+  <section class="band" id="how">
+    <div class="wrap">
+      <p class="kicker">How it works</p>
+      <h2 class="h2">Three moving parts, and one of them is you.</h2>
+
+      <ol class="steps">
+        <li>
+          <span class="num">1</span>
+          <h3>Describe the work</h3>
+          <p>Open an issue with a title and a paragraph of intent. The moment its
+             status matches a step in your pipeline, the factory picks it up — no
+             kicking off a job, no copying context into a chat window.</p>
+        </li>
+        <li>
+          <span class="num">2</span>
+          <h3>Agents run the stages</h3>
+          <p>Each stage runs a tool in the issue's own container: shape the work,
+             write the code, review it, run the gate, open the pull request. Output
+             streams into the dashboard while it happens.</p>
+        </li>
+        <li>
+          <span class="num">3</span>
+          <h3>You answer the hard parts</h3>
+          <p>When an agent hits a decision it shouldn't make alone, it asks and waits.
+             Answer in the dashboard — or by SMS or WhatsApp — and the stage picks up
+             exactly where it stopped.</p>
+        </li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- ── features ─────────────────────────────────────────────────────── -->
+  <section class="band alt" id="features">
+    <div class="wrap">
+      <p class="kicker">Why it holds up</p>
+      <h2 class="h2">Built for work you actually ship.</h2>
+      <p class="sub">An agent that writes code is the easy part. Everything around it —
+         isolation, review, a real test gate, a human in the loop — is what makes the
+         output mergeable.</p>
+
+      <div class="cards">
+        <article class="card">
+          <span class="ico">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3" y="3" width="7" height="7" rx="1.6"/><rect x="14" y="3" width="7" height="7" rx="1.6"/>
+              <rect x="3" y="14" width="7" height="7" rx="1.6"/><rect x="14" y="14" width="7" height="7" rx="1.6"/>
+            </svg>
+          </span>
+          <h3>One container per issue</h3>
+          <p>Every issue reserves its own container and its own checkout from a managed
+             pool. Two agents never share a working tree, so ten issues can move at once
+             without stepping on each other.</p>
+        </article>
+
+        <article class="card">
+          <span class="ico">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 6h9M4 12h16M4 18h12"/><circle cx="17.5" cy="6" r="2.2"/><circle cx="19.5" cy="18" r="2.2"/>
+            </svg>
+          </span>
+          <h3>Pipelines as configuration</h3>
+          <p>A pipeline is a map from issue status to tool, with its own concurrency
+             caps. It lives in version-controlled YAML — shared across projects, or
+             bespoke to one.</p>
+        </article>
+
+        <article class="card">
+          <span class="ico">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M20 6.5 10 17l-5-5"/>
+            </svg>
+          </span>
+          <h3>A gate that actually gates</h3>
+          <p>A scripted test stage runs your typecheck, your suite and your checks on the
+             exact commit the agent hands it. Red doesn't advance, and CI on the pull
+             request has the final word.</p>
+        </article>
+
+        <article class="card">
+          <span class="ico">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M17.5 18.5a4.5 4.5 0 0 0 .5-8.97 6 6 0 0 0-11.66-1.5A4 4 0 0 0 6.5 18.5z"/>
+            </svg>
+          </span>
+          <h3>Local metal, cloud overflow</h3>
+          <p>Run containers on your own Docker host, then spill to Fly.io when it fills
+             up. An ordered policy with per-tier caps decides where each one lands — and
+             the pool drains back down on its own.</p>
+        </article>
+
+        <article class="card">
+          <span class="ico">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="2.5" y="4" width="19" height="14" rx="2"/><path d="M6.5 9.5 9 12l-2.5 2.5M12 14.5h5"/>
+            </svg>
+          </span>
+          <h3>Live output, not a black box</h3>
+          <p>Watch every run stream as it happens. Questions, comments, progress and a
+             rolling summary all land on the issue thread, so anyone can catch up
+             without reading the log.</p>
+        </article>
+
+        <article class="card">
+          <span class="ico">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="6.5" cy="6" r="2.5"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="17.5" cy="12" r="2.5"/>
+              <path d="M6.5 8.5v7M9 6.5h4a2 2 0 0 1 2 2v1.5M9 17.5h4a2 2 0 0 0 2-2v-1.5"/>
+            </svg>
+          </span>
+          <h3>Fits the tools you have</h3>
+          <p>Pull requests on GitHub, optional two-way Linear sync, questions over SMS or
+             WhatsApp. Point it at a repo and it builds the development container
+             itself.</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── pipeline ─────────────────────────────────────────────────────── -->
+  <section class="band" id="pipeline">
+    <div class="wrap pipe-grid">
+      <div class="pipe-copy">
+        <p class="kicker">The pipeline</p>
+        <h2 class="h2">Every status is a step. Every step is a tool.</h2>
+        <p class="sub">An issue moves from one status to the next, and a stage hands off by
+           setting the one after it. Insert a step, drop one, cap how many run at once —
+           it's a list, and it's yours to change.</p>
+        <ul class="ticks">
+          <li>Scripted stages for the objective checks — tests, merges, handoffs.</li>
+          <li>Agent stages for the judgement calls, each with its own brief.</li>
+          <li>Human gates wherever you want one, including none.</li>
+        </ul>
+      </div>
+
+      <ol class="flow">
+        <li><span class="fdot c-def"></span><b>Intake</b><i>Is this clear enough to build?</i></li>
+        <li><span class="fdot c-plan"></span><b>Planning</b><i>Shape it, size it, write it down.</i></li>
+        <li><span class="fdot c-impl"></span><b>Implementation</b><i>Branch, build, commit.</i></li>
+        <li><span class="fdot c-rev"></span><b>Review</b><i>A second agent reads the diff.</i></li>
+        <li><span class="fdot c-rev"></span><b>Testing</b><i>The gate, on that exact commit.</i></li>
+        <li><span class="fdot c-int"></span><b>Merge</b><i>Rebase, PR, land it.</i></li>
+        <li><span class="fdot c-done"></span><b>Done</b><i>Deployed on push to main.</i></li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- ── config ───────────────────────────────────────────────────────── -->
+  <section class="band alt" id="config">
+    <div class="wrap pipe-grid">
+      <div class="pipe-copy">
+        <p class="kicker">Declarative by default</p>
+        <h2 class="h2">Your process, in a file you can review.</h2>
+        <p class="sub">Tools, workflows and projects are YAML, reconciled into the factory
+           when you push them. Change how work flows the same way you change anything
+           else: a diff, a review, a merge.</p>
+        <ul class="ticks">
+          <li>Share one workflow across projects, or give a project its own.</li>
+          <li>Cap concurrency per step so a busy backlog can't stampede.</li>
+          <li>Tools are just a setup script, a command and some params.</li>
+        </ul>
+      </div>
+
+      <div class="code">
+        <div class="code-bar"><span class="fname">config/workflows/team-development.yaml</span></div>
+<pre><code><span class="c"># statuses drive both the pipeline and the board</span>
+<span class="k">name</span><span class="p">:</span> <span class="s">Team Development</span>
+
+<span class="k">statuses</span><span class="p">:</span>
+  <span class="p">-</span> <span class="p">{</span> <span class="k">key</span><span class="p">:</span> <span class="s">implementation</span><span class="p">,</span> <span class="k">label</span><span class="p">:</span> <span class="s">Implementation</span> <span class="p">}</span>
+  <span class="p">-</span> <span class="p">{</span> <span class="k">key</span><span class="p">:</span> <span class="s">review</span><span class="p">,</span>         <span class="k">label</span><span class="p">:</span> <span class="s">Review</span> <span class="p">}</span>
+  <span class="p">-</span> <span class="p">{</span> <span class="k">key</span><span class="p">:</span> <span class="s">testing</span><span class="p">,</span>        <span class="k">label</span><span class="p">:</span> <span class="s">Testing</span> <span class="p">}</span>
+
+<span class="c"># a step: on this status, run this tool</span>
+<span class="k">pipeline</span><span class="p">:</span>
+  <span class="p">-</span> <span class="k">on</span><span class="p">:</span> <span class="s">implementation</span>
+    <span class="k">tool</span><span class="p">:</span> <span class="s">dev-agent</span>
+    <span class="k">params</span><span class="p">:</span> <span class="p">{</span> <span class="k">phase</span><span class="p">:</span> <span class="s">implement</span> <span class="p">}</span>
+    <span class="k">max</span><span class="p">:</span> <span class="n">2</span>          <span class="c"># at most two at a time</span>
+
+  <span class="p">-</span> <span class="k">on</span><span class="p">:</span> <span class="s">testing</span>
+    <span class="k">tool</span><span class="p">:</span> <span class="s">test-runner</span>  <span class="c"># scripted, not an agent</span>
+</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── quick start ──────────────────────────────────────────────────── -->
+  <section class="band start" id="start">
+    <div class="wrap start-inner">
+      <p class="kicker">Get started</p>
+      <h2 class="h2">Up in three commands.</h2>
+      <p class="sub">Deploy the factory once, point it at a repo, and open your first
+         issue. It runs as a single container and manages as many projects as you
+         give it.</p>
+
+      <div class="code">
+        <div class="code-bar"><span class="fname">your terminal</span></div>
+<pre><code><span class="c"># 1 — configure and deploy the factory</span>
+<span class="pr">$</span> cp .env.example .env
+<span class="pr">$</span> ./scripts/factory.sh up
+
+<span class="c"># 2 — stand up a project container from a repo</span>
+<span class="pr">$</span> ./scripts/factory.sh project up owner/repo
+
+<span class="c"># 3 — open the dashboard and file an issue</span>
+<span class="pr">$</span> ./scripts/factory.sh url
+</code></pre>
+      </div>
+
+      <div class="cta-row center">
+        <a class="btn btn-primary" href="docs.html">Read the docs</a>
+        <a class="btn btn-ghost" href="architecture.html">Architecture</a>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="foot">
+  <div class="wrap foot-inner">
+    <p class="foot-brand">Conveyor<span class="dot">.</span>AI</p>
+    <nav class="foot-links" aria-label="Documentation">
+      <a href="docs.html">Docs</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="self-deploy.html">Self-deploy</a>
+      <a href="linear-sync.html">Linear sync</a>
+      <a href="privacy.html">Privacy</a>
+      <a href="messaging.html">Messaging</a>
+    </nav>
+    <p class="foot-note">A factory for software work.</p>
+  </div>
+</footer>
+
+</body>
+</html>

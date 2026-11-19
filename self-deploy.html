@@ -1,0 +1,376 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Continuous deployment — factory self-deploy via a containerized runner — Conveyor.AI</title>
+<meta name="description" content="Continuous deployment: how the factory deploys its own repo through a containerized GitHub Actions runner.">
+<meta name="robots" content="index, follow">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b8dff'/%3E%3Crect x='12' y='9' width='9' height='9' rx='2' fill='%230c0e12'/%3E%3Cpath d='M8 22h16' stroke='%230c0e12' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="nav" id="top">
+  <div class="nav-inner">
+    <a class="brand" href="index.html">
+      <svg class="mark" viewBox="0 0 32 32" role="img" aria-label="Conveyor.AI">
+        <defs>
+          <linearGradient id="cmark" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#6f9bff"/>
+            <stop offset="1" stop-color="#8b5cf6"/>
+          </linearGradient>
+        </defs>
+        <rect width="32" height="32" rx="8.5" fill="url(#cmark)"/>
+        <rect x="11.5" y="8" width="9" height="9" rx="2" fill="#0b0d11"/>
+        <path d="M7.5 21.5h17" stroke="#0b0d11" stroke-width="2.2" stroke-linecap="round"/>
+        <circle cx="11" cy="25" r="1.7" fill="#0b0d11"/>
+        <circle cx="16" cy="25" r="1.7" fill="#0b0d11"/>
+        <circle cx="21" cy="25" r="1.7" fill="#0b0d11"/>
+      </svg>
+      <span class="wordmark">Conveyor<span class="dot">.</span>AI</span>
+    </a>
+
+    <nav class="nav-links" aria-label="Sections">
+      <a href="index.html#how">How it works</a>
+      <a href="index.html#features">Features</a>
+      <a href="index.html#pipeline">Pipeline</a>
+      <a href="index.html#config">Config</a>
+    </nav>
+
+    <a class="btn btn-primary btn-sm" href="index.html#start">Get started</a>
+  </div>
+</header>
+
+<main id="main">
+
+  <section class="band page-head">
+    <div class="wrap">
+      <p class="kicker">Documentation</p>
+      <h1 class="h2">Continuous deployment — factory self-deploy via a containerized runner</h1>
+      <p class="sub">The factory manages its own repo (<code>aif</code>) as a project: the agent makes changes on
+per-issue branches and merges them to <code>main</code>. <strong>Deployment is a separate, standard
+CD concern</strong> handled by GitHub Actions — not by the factory pipeline — so the
+agent never holds any infra credentials.</p>
+    </div>
+  </section>
+
+  <section class="band alt">
+    <div class="wrap prose doc">
+<p>On every push to <code>main</code>, <code>.github/workflows/deploy.yml</code>
+first confirms on a Ubicloud runner that the commit passed the <code>green-gate</code>
+check (the <code>verify-gate</code> job — it queries the check-run rather than re-running the
+suite, so it costs seconds and refuses to deploy an ungated commit) and that the
+mimi runner is online. Only then does
+the <strong>self-hosted runner that itself is a container on the docker host (mimi)</strong>
+safely redeploy the factory:</p>
+<div class="code"><pre><code>verify green-gate         # ungated commit =&gt; the deploy stops here, nothing is touched
+docker compose build      # build the new image first — the running factory stays up if this fails
+tag current image :prev   # for rollback
+docker compose up -d      # swap
+health-check the factory  # retry ~60s (over the shared network, by DNS)
+rollback to :prev if the new container is unhealthy</code></pre></div>
+<h3 id="why-a-container-runner-docker-out-of-docker">Why a container runner (docker-out-of-docker)</h3>
+<p>The runner container <strong>mounts the host's docker socket</strong>, so when the deploy job
+runs <code>factory.sh redeploy</code> it builds and swaps the factory as a <strong>sibling
+container on the same host daemon</strong> — exactly as a manual <code>factory.sh up</code> would,
+on the host's ports. This is docker-<strong>out</strong>-of-docker (sharing the host daemon via
+its socket), not docker-in-docker (a nested daemon). It works cleanly here because
+the factory's compose uses a <strong>named volume</strong> (<code>factory-data:/data</code>), not host bind
+mounts, and the build context is streamed to the daemon — so nothing depends on
+paths inside the runner container.</p>
+<p>The runner also <strong>joins the factory's shared network</strong> (<code>FACTORY_NETWORK</code>), so its
+health-check reaches the factory by its DNS alias on the container port. No SSH
+key and no deploy secret is ever exposed to GitHub, and no deploy credential ever
+lands in an agent-operated container.</p>
+<h2 id="one-time-setup">One-time setup</h2>
+<h3 id="1-provide-a-github-registration-credential">1. Provide a GitHub registration credential</h3>
+<p>The runner registers itself with GitHub on first boot. Give it <strong>one</strong> of:</p>
+<ul><li><strong><code>RUNNER_PAT</code></strong> — a repo-scoped GitHub <strong>personal access token</strong> (fine-grained:
+the <code>aif</code> repo with <strong>Administration: read &amp; write</strong>, or a classic token with
+<code>repo</code>). The runner image uses it to mint registration tokens itself, and can
+re-register across restarts. <em>Recommended.</em></li><li><strong><code>RUNNER_TOKEN</code></strong> — a <strong>one-time registration token</strong> from
+<strong>repo → Settings → Actions → Runners → New self-hosted runner</strong> (valid ~1 hour,
+single use).</li></ul>
+<blockquote><p>Create this token yourself in GitHub — never paste a token into chat, and never
+commit it.</p></blockquote>
+<p><strong>Where to put it.</strong> Not in the main <code>.env</code> — that file is stored verbatim as the
+<code>FACTORY_ENV</code> deploy secret and shipped to the deploy job, which has no need for
+the runner's registration credential. Instead, put it in <strong><code>.env.runner</code></strong>
+(gitignored; copy <code>.env.runner.example</code>), which
+<code>factory.sh runner</code> sources on its own:</p>
+<div class="code"><pre><code class="language-bash">cp .env.runner.example .env.runner
+#   set RUNNER_PAT=... (recommended) — or RUNNER_TOKEN=... for a one-time token</code></pre></div>
+<p>Or skip the file and pass it inline: <code>RUNNER_PAT=... ./scripts/factory.sh runner up</code>.
+A short-lived <code>RUNNER_TOKEN</code> is best passed inline rather than saved.</p>
+<h3 id="2-run-everything-from-your-operator-machine-no-shell-on-mimi">2. Run everything from your operator machine — no shell on mimi</h3>
+<p><code>factory.sh</code> drives mimi's docker daemon over <code>DOCKER_HOST=ssh://$DEPLOY_SSH</code>, so
+<strong>every</strong> <code>runner</code> command runs from the same machine you already deploy the
+factory from. <code>runner up</code> <em>creates the container on mimi</em> over that SSH tunnel;
+you never open a shell on mimi.</p>
+<p><strong>Running <code>factory.sh runner ...</code> ON mimi itself needs <code>FACTORY_DEPLOY_LOCAL=1</code></strong>
+(<code>FACTORY_DEPLOY_LOCAL=1 ./scripts/factory.sh runner up</code>). Without it the script
+reaches mimi's daemon over <code>ssh://$DEPLOY_SSH</code> — i.e. it SSHes into itself — and
+fails with <em>&quot;Too many authentication failures&quot;</em>.</p>
+<p>The one thing that isn't a CLI knob is a Docker Desktop <strong>GUI</strong> setting on mimi —
+but it's on by default, so usually there's nothing to do:</p>
+<ul><li>The runner mounts <code>/var/run/docker.sock</code>. On Docker Desktop for Mac that path is
+a symlink to <code>~/.docker/run/docker.sock</code>, and bind-mounting it into a container
+works <strong>by default</strong> (verified: a sibling container reaches the daemon through
+it). <code>runner up</code> runs a <strong>preflight</strong> that confirms this from your machine and
+fails with a clear message if it can't.</li><li><p>If that preflight fails, enable <strong>Settings → Advanced → &quot;Allow the default
+Docker socket to be used&quot;</strong> on mimi, <strong>or</strong> set <code>DOCKER_SOCK</code> to the socket path
+<strong>as it exists on mimi</strong> (an absolute path — not <code>$HOME</code>, which would expand on
+your machine, not mimi):</p>
+<div class="code"><pre><code class="language-bash">DOCKER_SOCK=/Users/&lt;mimi-user&gt;/.docker/run/docker.sock \
+  RUNNER_PAT=&lt;pat&gt; ./scripts/factory.sh runner up</code></pre></div>
+<p><code>factory.sh runner</code> honors <code>DOCKER_SOCK</code> (default <code>/var/run/docker.sock</code>).</p></li></ul>
+<h3 id="3-bring-the-runner-up-from-your-operator-machine">3. Bring the runner up (from your operator machine)</h3>
+<p>With your <code>.env</code> present (it supplies <code>DEPLOY_SSH</code>, <code>FACTORY_NAME</code>,
+<code>FACTORY_NETWORK</code>, <code>FACTORY_HOSTNAME</code>, <code>DASHBOARD_CONTAINER_PORT</code>):</p>
+<div class="code"><pre><code class="language-bash"># repo-scoped PAT (recommended):
+RUNNER_PAT=&lt;your-github-pat&gt; ./scripts/factory.sh runner up
+
+# ...or a one-time registration token:
+RUNNER_TOKEN=&lt;registration-token&gt; ./scripts/factory.sh runner up
+
+./scripts/factory.sh runner logs     # watch it register (&quot;Listening for Jobs&quot;)
+./scripts/factory.sh runner ps</code></pre></div>
+<p><code>runner up</code> preflights the socket mount, <strong>pulls the current runner image</strong>, then
+starts the runner container <strong>on
+mimi</strong> on <code>FACTORY_NETWORK</code>, labeled <strong><code>mimi</code></strong> (the workflow targets
+<code>runs-on: [self-hosted, mimi]</code>), with the docker socket mounted. Manage it — all
+from your machine — with:</p>
+<div class="code"><pre><code class="language-bash">./scripts/factory.sh runner up|down|rm|logs|ps
+#   down = stop (keep the work volume);  rm = stop + delete the volume</code></pre></div>
+<p>Confirm it appears <strong>Idle</strong> under <strong>repo → Settings → Actions → Runners</strong>.</p>
+<h3 id="4-add-the-factory-runtime-env-as-a-repo-secret">4. Add the factory runtime env as a repo secret</h3>
+<p>The redeployed container must come up with the <strong>same</strong> runtime env it was first
+deployed with (same OAuth client, <code>SERVICE_TOKEN</code>, ports, <code>FACTORY_NAME</code>,
+network …) — otherwise the credentials/ports change out from under you.
+<code>factory.sh redeploy</code> refuses to run if <code>GOOGLE_CLIENT_ID</code>,
+<code>GOOGLE_CLIENT_SECRET</code> or <code>SERVICE_TOKEN</code> is missing from that env, because with
+no shared URL token left there would be no way back into the dashboard.</p>
+<p>Store your factory <code>.env</code> <strong>verbatim</strong> as a single repo secret:</p>
+<ul><li>GitHub: <strong>repo → Settings → Secrets and variables → Actions → New repository secret</strong></li><li>Name: <code>FACTORY_ENV</code></li><li>Value: the full contents of the <code>.env</code> you deploy the factory with (it contains
+<code>FACTORY_NAME</code>, <code>DASHBOARD_PORT</code>, <code>DASHBOARD_CONTAINER_PORT</code>,
+<code>GOOGLE_CLIENT_ID</code>, <code>GOOGLE_CLIENT_SECRET</code>, <code>FACTORY_PUBLIC_URL</code>,
+<code>SERVICE_TOKEN</code>, <code>FACTORY_NETWORK</code>, <code>FACTORY_HOSTNAME</code>, <code>GH_TOKEN</code>,
+<code>GIT_AUTHOR_*</code>, etc.).</li></ul>
+<p>The workflow writes it to <code>.env</code> at deploy time and removes it after. <code>DEPLOY_SSH</code>
+in that env is ignored — the workflow sets <code>FACTORY_DEPLOY_LOCAL=1</code> so <code>factory.sh
+redeploy</code> uses the docker daemon reached through the mounted socket.</p>
+<p>The health-check target is supplied by the <strong>runner container's</strong> environment
+(<code>FACTORY_HEALTH_HOST</code> = <code>FACTORY_HOSTNAME</code>, <code>FACTORY_HEALTH_PORT</code> =
+<code>DASHBOARD_CONTAINER_PORT</code>, set in <code>runner/compose.yaml</code>),
+so the deploy job reaches the factory by DNS over the shared network. The probe
+hits <strong><code>/health</code></strong> — the only unauthenticated route left; <code>/</code> now redirects an
+anonymous request to <code>/login</code>.</p>
+<h3 id="5-optional-let-the-deploy-notice-a-dead-runner-runner_status_pat">5. (Optional) Let the deploy notice a dead runner — <code>RUNNER_STATUS_PAT</code></h3>
+<p>A wedged runner does not make a deploy fail; it makes it <strong>wait</strong>. The job sits
+queued until GitHub cancels it at its 24-hour ceiling, and because the running
+factory is untouched the whole time, it reads as &quot;deploy pending&quot; rather than as
+a problem. <code>timeout-minutes</code> does not help — that bounds a job which is running,
+not one waiting to be picked up (measured: a job with <code>timeout-minutes: 2</code> on a
+label no runner had was still queued at 2m25s).</p>
+<p>The runner preflight step in <code>deploy.yml</code>'s <code>verify-gate</code> job closes that gap by
+asking GitHub whether any <strong>online</strong> runner carries the <code>mimi</code> label before the
+deploy is queued. It runs on Ubicloud, never on mimi, since the point is to notice
+mimi being gone. It reads the repo's own runners and, when the repo is in an
+org, the org's — org-level runners (such as a pool serving every repo in the
+org) are only on the org's list. Those lists need repo <strong><code>Administration: read</code></strong>
+and org <strong><code>Self-hosted runners: read</code></strong> respectively, which <code>GITHUB_TOKEN</code> cannot
+be granted, so it takes a PAT:</p>
+<ul><li>Put it in <code>.env</code> as <code>RUNNER_STATUS_PAT=…</code> and run <code>./scripts/push-env.sh</code>. It
+sets the <code>RUNNER_STATUS_PAT</code> repo secret from that line and strips the line out
+of <code>FACTORY_ENV</code>, so the token never reaches the deploy host. Removing the line
+later leaves the secret alone; <code>gh secret delete RUNNER_STATUS_PAT</code> clears it.</li><li>Value: a fine-grained token for this repo with <strong>Administration: Read</strong> — plus,
+for org runners, the org's <strong>Self-hosted runners: Read</strong> (a classic token with
+<code>repo</code> and <code>admin:org</code> also works). For a repo-level container runner, the
+<code>RUNNER_PAT</code> in <code>.env.runner</code> already has the access — reuse it, or mint a
+read-only one.</li></ul>
+<p><strong>It is optional by design.</strong> With no secret set, or with a token that cannot
+read the list, the step prints a warning and passes, so a factory that has not set
+one deploys exactly as it did before. Only a token that <em>can</em> read the list and
+finds no online <code>mimi</code> runner blocks the deploy — with the fix in the log:</p>
+<div class="code"><pre><code>./scripts/factory.sh runner down &amp;&amp; ./scripts/factory.sh runner up</code></pre></div>
+<p>Note that is a <strong>recreate</strong>, not a restart. <code>docker restart</code> cannot fix a wedged
+runner — it is what causes it (see <em>Notes / options</em>).</p>
+<p>If the runner is not merely offline but <strong>missing from the repo's runner list</strong>,
+look in <code>./scripts/factory.sh runner logs</code> for <em>&quot;deprecated&quot;</em>. The image is the
+floating <code>myoung34/github-runner:latest</code> with the runner's own auto-update
+disabled, so the runner version only changes when the image does. A host that kept
+an old cached image ends up on a version GitHub has retired: it registers, logs
+<em>&quot;Runner version vX is deprecated and cannot receive messages&quot;</em>, and deregisters
+itself on exit. Re-run <code>./scripts/factory.sh runner up</code> — it runs
+<code>docker compose pull</code> before starting, so it picks up the current image (AIF-716).</p>
+<hr>
+<h3 id="6-the-stage-factory-aif-653">6. The stage factory (AIF-653)</h3>
+<p>A merge to <code>main</code> deploys a <strong>stage</strong> factory; production changes only when
+someone promotes a commit. Stage is a second factory on the same host, made by
+the same <code>factory.sh redeploy</code> with a different env file, so everything that
+follows from <code>FACTORY_NAME</code> — container, named volume, image, DNS alias — is its
+own. It starts with fresh data and loads no project (the repo's projects ship as
+<code>.yaml.txt</code>), so it never drives a real repo.</p>
+<ol><li>Write <code>.env.stage</code> (git-ignored) from your production <code>.env</code>, changing:
+<code>FACTORY_NAME=aif-stage</code>, <code>DASHBOARD_PORT</code>, <code>DEV_SSH_PORT</code> and the
+<code>STAGE_PROXY_PORT</code>/<code>STAGE_PROXY_PORT_END</code> range to ports free on mimi, and
+<code>FACTORY_PUBLIC_URL</code> (if set) to stage's own address. Keep <code>FACTORY_NETWORK</code> (stage joins
+production's network under its own alias). Leave out credentials stage
+has no business holding — <code>LINEAR_API_KEY</code>, <code>FLY_API_TOKEN</code>, <code>GH_TOKEN</code>.
+<strong><code>FACTORY_NAME</code> is the one that matters most</strong>: it is what keeps stage off
+production's container and data volume, and it is also stage's alias on the
+shared network — so it must be whatever stage's tunnel route points at. Left
+at production's value, the stage deploy rebuilds PRODUCTION with stage's env
+and its health check passes anyway. <code>scripts/check-stage-env.sh</code> refuses that
+(and any shared alias or host port); both the deploy and the next step run it.
+<strong>Give stage its own <code>SESSION_COOKIE_NAME</code></strong> (e.g. <code>fsid_stage</code>), and keep
+its <code>SESSION_COOKIE_DOMAIN</code> to its own host. Production scopes its <code>fsid</code>
+cookie to the parent domain, so the browser sends it to stage as well; under
+the same name stage reads production's session first, finds no such session
+in its own database, and every sign-in lands back on <code>/login</code>. The check
+refuses that too. Leave production on the default — the iOS and desktop apps
+look for <code>fsid</code> by name.</li><li><code>./scripts/push-env.sh --stage</code> — sets the <code>FACTORY_STAGE_ENV</code> secret.</li><li>To sign in to stage in a browser, give it a tunnel route, and add
+<code>&lt;stage url&gt;/auth/google/callback</code> to the Google OAuth client's redirect URIs.</li><li>The production factory's <code>GH_TOKEN</code> needs <strong>Actions: read &amp; write</strong> on this
+repo, so the Deployments tab can dispatch the promotion and follow the run.</li></ol>
+<p>Until <code>FACTORY_STAGE_ENV</code> exists, a push to <code>main</code> fails at the stage redeploy
+with a message saying so. Production is untouched and can still be promoted.</p>
+<p><strong>Deploying merges straight to production (AIF-655).</strong> Where a merge goes is
+one repository variable, <code>DEPLOY_ON_MERGE</code> — flipped without a commit, in the
+repo's Settings → Secrets and variables → Actions → Variables, or:</p>
+<div class="code"><pre><code class="language-bash">gh variable set DEPLOY_ON_MERGE --body production   # merges deploy production
+gh variable delete DEPLOY_ON_MERGE                  # back to stage (the default)</code></pre></div>
+<p>Or from the project's Deployments tab: the <strong>Merges deploy to</strong> switch
+(AIF-660) does exactly those two calls, because <code>.factory/deployments.yaml</code>
+names the variable under <code>merge_target</code>. It needs <code>GH_TOKEN</code> to have
+<strong>Variables: write</strong> on the repo, and it records who flipped it in the tab's
+recent actions.</p>
+<p>Only <code>production</code> (any case) opts in; unset, <code>stage</code> or anything else means
+stage, so a typo never ships to production. A dispatch (Promote, or Run
+workflow) goes to its <code>target</code> input — production unless it says <code>stage</code>. A merge going to production takes the
+production path unchanged — <code>verify-gate</code> still has to pass, <code>FACTORY_ENV</code> is
+used, it queues with promotions, and a <code>production</code> deployment is recorded.
+The flip takes effect from the next run. While it is set, stage gets no merges,
+so the Deployments tab will show stage falling behind production. Each run's
+summary says which target it picked and the variable value behind it.</p>
+<p><strong>Choosing which branch auto-deploys (AIF-704).</strong> By default a push to <code>main</code>
+deploys. Which branch does is a second repository variable, <code>DEPLOY_BRANCH</code>:</p>
+<div class="code"><pre><code class="language-bash">gh variable set DEPLOY_BRANCH --body release   # pushes to `release` deploy instead
+gh variable delete DEPLOY_BRANCH               # back to main (the default)</code></pre></div>
+<p>Or from the Deployments tab: the <strong>Auto-deploy branch</strong> picker lists origin's
+branches and makes those two calls, because <code>.factory/deployments.yaml</code> names
+the variable under <code>deploy_branch</code> (choosing the base branch deletes it). It
+needs the same <strong>Variables: write</strong> as the merge-target switch. Where the push
+deploys is still <code>DEPLOY_ON_MERGE</code>, and <strong>Deploy latest</strong> ships the chosen
+branch's head (dispatched on <code>main</code>, where the workflow file lives).</p>
+<p>Any project can opt in the same way, but its deploy workflow has to honour the
+variable itself — the factory only sets it. Two things that workflow needs:</p>
+<ul><li><strong>Trigger on every branch and gate at job level.</strong> A push filter cannot read
+a variable, so <code>on.push.branches</code> is <code>['**']</code> and the first job carries
+<code>if: github.event_name != 'push' || github.ref_name == (vars.DEPLOY_BRANCH || 'main')</code>,
+with every other job <code>needs:</code>-ing it. A false job-level <code>if</code> is skipped without
+a runner, so a push to any other branch costs nothing (it shows as a skipped
+run).</li><li><strong>Give a skipped run its own concurrency group.</strong> A group holds one running
+and one waiting run, and a newer waiting run cancels the older one — so a
+skipped push sharing <code>deploy-factory-stage</code> could cancel a real deploy queued
+there. aif's group starts with
+<code>(github.event_name == 'push' &amp;&amp; github.ref_name != (vars.DEPLOY_BRANCH || 'main')) &amp;&amp; github.run_id || …</code>.</li></ul>
+<p><code>verify-gate</code> is unchanged and fails closed: a commit on the chosen branch
+deploys only if it passed <code>green-gate</code> on a PR. A direct push, or a PR into a
+branch ci.yml's <code>pull_request</code> filter does not cover, is refused — widen that
+filter (as <code>epic/**</code> already is) if the branch should take PRs.</p>
+<h2 id="how-a-change-ships">How a change ships</h2>
+<ol><li>You submit an aif issue; the agent works it (branch → build/typecheck → PR
+pushed). You review and approve; the merge stage lands it on <code>main</code>.</li><li><p>The push to <code>main</code> (or the <code>DEPLOY_BRANCH</code> you chose) triggers <code>deploy-factory</code>, which deploys <strong>stage</strong> (or
+production, when <code>DEPLOY_ON_MERGE=production</code> — see §6).
+<code>verify-gate</code> confirms the commit's <code>green-gate</code> check passed (following the
+commit back to its PR, since the check-run lives on the PR head). Then the mimi
+runner <strong>container</strong> checks out that commit, materialises <code>.env</code> from
+<code>FACTORY_STAGE_ENV</code>, and runs <code>./scripts/factory.sh redeploy</code> against the host
+daemon via the mounted socket. A <code>staging</code> GitHub deployment is recorded
+(the <code>record-deployment</code> job, on Ubicloud).</p>
+<p><strong>Where each job runs (AIF-686).</strong> Only <code>redeploy</code> is on mimi. <code>verify-gate</code>
+(gate check + runner preflight) and <code>record-deployment</code> run on
+<code>ubicloud-standard-2</code>, like ci.yml and pages.yml, so none of this workflow
+uses GitHub-hosted minutes. GitHub bills every job a whole minute however
+short, which is why the preflight is a step in <code>verify-gate</code> and not a job of
+its own.</p></li><li><strong>Promote</strong> — the project's <strong>Deployments</strong> tab lists what is on stage but not
+on production; its Promote button dispatches <code>deploy-factory</code> with that exact
+<code>sha</code>. The run verifies the gate on that sha, checks it out, redeploys
+production from <code>FACTORY_ENV</code>, and records a <code>production</code> deployment — which is
+also when the factory's issues get their deployed mark (AIF-459).
+The tab also has <strong>Deploy latest → stage / production</strong> buttons (AIF-662):
+they dispatch <code>deploy-factory</code> with <code>main</code>'s head and <code>target=stage|production</code>
+— for re-shipping after a failed merge deploy, or shipping <code>main</code> straight to
+production. Declared under <code>deploy_latest</code> in <code>.factory/deployments.yaml</code>.</li><li>Build fails → the running factory is untouched. New container unhealthy → it
+auto-rolls-back to the previous image. Healthy → you're on the new version.</li></ol>
+<p>Stage and production each have their own concurrency group, so a merge never
+queues behind a promotion. The contract the tab reads is <code>.factory/deployments.yaml</code>
+(format in <code>factory/server/src/deployconfig.ts</code>): it takes each environment's
+commit from the latest <strong>successful</strong> GitHub deployment in <code>staging</code> /
+<code>production</code> — the ones step 2 and 3 record — rather than calling either
+factory's <code>/health</code>.</p>
+<p>Watch a deploy under the repo's <strong>Actions</strong> tab. You can also run
+<code>deploy-factory</code> by hand there (<strong>Run workflow</strong>): it deploys production at
+<code>sha</code>, or <code>main</code>'s head when <code>sha</code> is blank. Roll back by promoting an older
+sha. The button takes a <code>skip_gate_check</code> input for the emergency case where you
+must redeploy a commit the gate never blessed.</p>
+<h2 id="notes-options">Notes / options</h2>
+<ul><li><strong>Signing the Mac app</strong> is five more repo secrets, set by
+<code>./scripts/push-mac-signing.sh</code> from a local <code>.env.macsign</code>, never pasted into
+GitHub. Without them the app is ad-hoc signed. See
+docs/mac-signing.md.</li><li><strong>Publishing the site is one more repo secret, <code>SITE_DEPLOY_KEY</code>.</strong> On a Free
+org, GitHub serves Pages from public repos only, so a private repo can't serve
+its own site. <code>pages.yml</code> builds the site and pushes it to a separate PUBLIC
+site repo, which is what Pages serves. The secret holds the private half of a
+deploy key that has <strong>write</strong> access to that repo, and to nothing else. If it
+is missing, <code>pages.yml</code> stops at its publish step and says so. The site repo is
+generated: every publish replaces its whole tree, so never edit anything in it
+by hand. If your own repo is public, or on a paid plan, publish Pages from it
+directly and skip all of this.</li><li><strong>A wedged runner is RECREATED, never restarted.</strong> A restart reuses the
+container's writable layer, so the registration from its first boot is still
+there — and the image's entrypoint clears <code>.runner</code> but not <code>.credentials</code>.
+That half-configured pair fails both ways (<code>config.sh</code> refuses with *&quot;already
+configured&quot;<em>; removal fails with </em>&quot;Value cannot be null (configuredSettings)&quot;*),
+the container exits 2, and <code>restart: unless-stopped</code> repeats it forever. So
+<code>docker restart</code> cannot fix this state — it is what produces it. Use
+<code>./scripts/factory.sh runner down &amp;&amp; ./scripts/factory.sh runner up</code>, which
+gives a fresh layer. <code>runner/compose.yaml</code> now clears both files in an
+entrypoint wrapper, so a host reboot re-registers on its own; the recreate is
+for a container created before that fix, or for any other stuck state.</li><li><strong>Host runner instead of a container:</strong> if you'd rather run the runner as a raw
+host service, register it the usual way (GitHub's shown <code>config.sh</code>/<code>svc.sh</code>
+steps) with the label <code>mimi</code> and add its user to the <code>docker</code> group. The same
+workflow then health-checks the factory at <code>127.0.0.1:${DASHBOARD_PORT}</code> (the
+published host port) — <code>factory.sh redeploy</code> defaults there when the container's
+<code>FACTORY_HEALTH_*</code> vars are absent.</li><li><strong>Extra approval gate:</strong> add <code>environment: production</code> to the job and require
+reviewers on that environment for a second human click before each deploy. (The
+factory already gates via issue approval before merge, so this is optional.)</li><li><strong>Config-only changes</strong> (tools/workflows YAML under <code>config/</code>) don't need a full
+redeploy — they take effect via <code>factory.sh config-push</code>/<code>reload</code>. The redeploy
+rebuilds the whole image, which also covers them.</li><li><strong>Multiple factories on one host:</strong> give each its own runner (unique
+<code>FACTORY_NAME</code> → its own runner project/label) + <code>FACTORY_ENV</code> secret (or use
+GitHub Environments) and a workflow per instance.</li></ul>
+    </div>
+  </section>
+
+</main>
+
+<footer class="foot">
+  <div class="wrap foot-inner">
+    <p class="foot-brand">Conveyor<span class="dot">.</span>AI</p>
+    <nav class="foot-links" aria-label="Documentation">
+      <a href="docs.html">Docs</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="self-deploy.html">Self-deploy</a>
+      <a href="linear-sync.html">Linear sync</a>
+      <a href="privacy.html">Privacy</a>
+      <a href="messaging.html">Messaging</a>
+    </nav>
+    <p class="foot-note">A factory for software work.</p>
+  </div>
+</footer>
+
+</body>
+</html>
